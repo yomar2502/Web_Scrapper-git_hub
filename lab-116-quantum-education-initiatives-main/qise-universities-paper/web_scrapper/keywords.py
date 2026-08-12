@@ -67,7 +67,7 @@ CORE_TERMS: dict[str, list[str]] = {
     "quantum_computing": [
         "quantum computing", "quantum computation", "quantum computer",
         "computacion cuantica", "computação quantica", "computacao quantica",
-        "computadora cuantica", "computador quantico", "computacao quantica",
+        "computadora cuantica", "computador quantico",
     ],
     "quantum_information": [
         "quantum information", "informacion cuantica", "informacao quantica",
@@ -177,7 +177,7 @@ GENERIC_TERMS: dict[str, list[str]] = {
 COURSE_SIGNALS_STRONG = [
     "silabo", "syllabus", "malla curricular", "plan de estudios", "plan de estudio",
     "grade curricular", "matriz curricular", "plano de ensino", "projeto pedagogico",
-    "ementa", "creditos", "credito", "prerrequisito", "prerrequisito", "prerequisite",
+    "ementa", "creditos", "credito", "prerrequisito", "prerequisito", "prerequisite",
     "pre-requisito", "pre requisito", "codigo del curso", "codigo de la asignatura",
     "carga horaria", "horas teoricas", "horas practicas", "unidades de credito",
     "pensum", "cuadro de asignaturas",
@@ -298,6 +298,7 @@ LOW_PRIORITY_TERMS = [
 
 
 # ── COMPILED MATCHERS ─────────────────────────────────────────────────────────
+_PLURAL_SUFFIX = r"(?:es|s)?"
 
 def _compile_phrase(phrase: str) -> re.Pattern:
     """Word-boundary regex on the folded phrase; tolerant of internal whitespace."""
@@ -367,15 +368,9 @@ def has_quantum_term(text: str) -> bool:
 
 _PHRASE_CACHE: dict[str, re.Pattern] = {}
 
-
 def _compile_phrase_plural(phrase: str) -> re.Pattern:
-    """Like _compile_phrase but the last token tolerates a plural 's'
-    ("carrera" also matches "carreras", "course" matches "courses")."""
-    folded = fold(phrase)
-    tokens = folded.split()
-    body = r"\s+".join(re.escape(t) for t in tokens)
-    return re.compile(r"(?<![\w])" + body + r"s?(?![\w])")
-
+    """Alias de _compile_phrase — mantenido por compatibilidad de nombre."""
+    return _compile_phrase(phrase)
 
 def match_terms(text: str, terms: list[str]) -> list[str]:
     """

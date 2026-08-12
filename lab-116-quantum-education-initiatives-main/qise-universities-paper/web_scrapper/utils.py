@@ -8,6 +8,9 @@ import re
 import time
 import unicodedata
 import urllib.robotparser
+
+import requests
+
 from pathlib import Path
 from functools import wraps
 from datetime import datetime, timezone
@@ -50,7 +53,7 @@ def get_logger(name: str, log_dir: str = "logs") -> logging.Logger:
 # ── RATE LIMITER ──────────────────────────────────────────────────────────────
 
 class RateLimiter:
-    """Simple token-bucket rate limiter. Thread-safe for single-thread use."""
+    """Simple fixed-delay rate limiter for sequential crawling."""
 
     def __init__(self, min_delay: float = 2.0):
         self.min_delay = min_delay
@@ -90,8 +93,15 @@ def normalize_text(text: str) -> str:
 def normalize(text: str) -> str:
     if not text:
         return ""
-    text = unicodedata.normalize("NFKC", text)
-    return text.encode("utf-8", "ignore").decode("utf-8").lower()
+
+    text = unicodedata.normalize("NFKD", text)
+
+    text = "".join(
+        c for c in text
+        if not unicodedata.combining(c)
+    )
+
+    return text.lower()
 
 
 def clean_course_text(text: str) -> str:
@@ -116,7 +126,11 @@ def clean_course_text(text: str) -> str:
 def extract_course_code(text: str) -> str | None:
     """Try to extract a course code like FIS-3210, PHYS301, CS 4820."""
     pattern = r"\b([A-Z]{2,5}[-\s]?\d{3,5}[A-Z]?)\b"
-    match = re.search(pattern, text)
+    match = re.search(
+    pattern,
+    text,
+    flags=re.IGNORECASE
+    )
     return match.group(1) if match else None
 
 
@@ -131,26 +145,122 @@ def slugify(text: str) -> str:
 def detect_language(text: str) -> str:
     """
     Lightweight heuristic language detection (es / pt / en).
-    Avoids needing an external library for the common LatAm case.
+    Designed for academic course texts in Latin America.
     """
-    text_lower = text.lower()
-    es_markers = ["curso", "asignatura", "créditos", "prerequisito", "semestre",
-                  "computación", "física", "información", "cuántico"]
-    pt_markers = ["curso", "disciplina", "créditos", "pré-requisito", "semestre",
-                  "computação", "física", "informação", "quântico"]
-    en_markers = ["course", "credit", "prerequisite", "semester", "lecture",
-                  "quantum", "computing", "physics", "information"]
+
+    if not text:
+        return "unknown"
+
+    text_lower = normalize(text)
+
+    es_markers = [
+        "curso",
+        "asignatura",
+        "creditos",
+        "prerrequisito",
+        "semestre",
+        "computacion",
+        "fisica",
+        "informacion",
+        "cuantico",
+        "plan de estudios",
+    ]
+
+    pt_markers = [
+        "curso",
+        "disciplina",
+        "creditos",
+        "pre-requisito",
+        "semestre",
+        "computacao",
+        "fisica",
+        "informacao",
+        "quantico",
+        "ementa",
+        "graduacao",
+    ]
+
+    en_markers = [
+        "course",
+        "credits",
+        "prerequisite",
+        "semester",
+    ]
+
+    technical_markers = [
+        "quantum",
+        "computing",
+        "physics",
+        "information",
+    ]
+
+    english_academic_markers = [
+        "introduction to",
+        "advanced",
+        "theory",
+        "algorithms",
+        "mechanics",
+    ]
 
     scores = {
-        "es": sum(1 for w in es_markers if w in text_lower),
-        "pt": sum(1 for w in pt_markers if w in text_lower),
-        "en": sum(1 for w in en_markers if w in text_lower),
+        "es": sum(marker in text_lower for marker in es_markers),
+        "pt": sum(marker in text_lower for marker in pt_markers),
+        "en": sum(marker in text_lower for marker in en_markers),
     }
-    # Portuguese and Spanish share many words — use exclusive markers to break ties
-    if scores["pt"] >= scores["es"]:
-        pt_exclusive = ["quântico", "computação", "disciplina", "pré-requisito"]
-        if any(w in text_lower for w in pt_exclusive):
+
+    technical_score = sum(
+        marker in text_lower
+        for marker in technical_markers
+    )
+
+    if (
+            (scores["en"] >= 2 or technical_score >= 2)
+            and scores["es"] == 0
+            and scores["pt"] == 0
+        ):
+            return "en"
+
+    # Sin evidencia
+    if max(scores.values()) == 0:
+        return "unknown"
+
+    
+    # Resolver empate español-portugués
+    if scores["es"] == scores["pt"]:
+
+        pt_exclusive = [
+            "disciplina",
+            "computacao",
+            "informacao",
+            "quantico",
+            "ementa",
+            "graduacao",
+        ]
+
+        es_exclusive = [
+            "asignatura",
+            "computacion",
+            "informacion",
+            "cuantico",
+            "plan de estudios",
+            "malla curricular",
+        ]
+
+        if any(word in text_lower for word in pt_exclusive):
             return "pt"
+
+        if any(word in text_lower for word in es_exclusive):
+            return "es"
+
+        if technical_score >= 2:
+            return "es"
+
+    max_score = max(scores.values())
+
+    if list(scores.values()).count(max_score) > 1:
+        return "unknown"
+
+    # Si no hay evidencia suficiente, usar el mayor puntaje
     return max(scores, key=scores.get)
 
 
@@ -168,24 +278,23 @@ def is_likely_course_page(url: str, text: str) -> bool:
     Heuristic: does this URL / text look like a course or syllabus page?
     Used to filter irrelevant crawled pages early.
     """
+    from keywords import count_signals
+ 
     url_signals = [
         "curso", "course", "syllabus", "silabo", "sílabo",
         "asignatura", "disciplina", "programa", "materia",
         "catalogo", "catalog", "oferta", "pensum",
     ]
-    text_signals = [
-        "créditos", "creditos", "credits", "prerequisito",
-        "pre-requisito", "horas", "hours", "semestre", "semester",
-        "objetivos", "objectives", "contenido", "content",
-        "bibliografía", "referencias", "syllabus",
-    ]
     url_lower = url.lower()
-    text_lower = text.lower()[:2000]  # only check start of text
-
     url_hit = any(s in url_lower for s in url_signals)
-    text_hit = sum(1 for s in text_signals if s in text_lower) >= 2
+ 
+    # keywords.count_signals ya hace folding de tildes y tolera plural;
+    # umbral (strong>=1 o weak>=2) elegido para mantener la sensibilidad
+    # similar a la versión original (que pedía >=2 coincidencias de texto).
+    snippet = text[:2000]
+    text_hit = count_signals(snippet, "strong") >= 1 or count_signals(snippet, "weak") >= 2
+ 
     return url_hit or text_hit
-
 
 # ── URL HELPERS ───────────────────────────────────────────────────────────────
 
@@ -218,6 +327,10 @@ def normalize_url(url: str, base: str | None = None) -> str:
         return ""
     scheme = (p.scheme or "https").lower()
     netloc = p.netloc.lower()
+    # Drop default ports
+    if not netloc:
+        return ""
+ 
     # Drop default ports
     if netloc.endswith(":80") and scheme == "http":
         netloc = netloc[:-3]
@@ -264,7 +377,7 @@ def same_registered_domain(url: str, allowed_netloc: str) -> bool:
     allowed = allowed_netloc.lower().split(":")[0]
     if not host or not allowed:
         return False
-    return host == allowed or host.endswith("." + allowed) or allowed.endswith("." + host)
+    return host == allowed or host.endswith("." + allowed)
 
 
 def url_hash(url: str) -> str:
@@ -367,14 +480,20 @@ def evidence_snippet(text: str, start: int, end: int, radius: int = 140) -> str:
     suffix = "…" if hi < len(text) else ""
     return f"{prefix}{frag}{suffix}"
 
+_ABBREV_RE = re.compile(
+    r"\b(Ing|Lic|Dr|Dra|Mg|M\.Sc|MSc|Prof|Univ|Av|Jr|Sr|Sra)\.\s*$"
+)
 
 def _looks_like_heading(line: str) -> bool:
     """Course-title shaped: short, no sentence break, starts upper/digit."""
     if not (3 <= len(line) <= 90):
         return False
-    if ". " in line:  # sentences are prose, not titles
-        return False
+    for m in re.finditer(r"\.\s", line):
+        before = line[:m.start() + 1]  # incluye el punto, no el espacio
+        if not _ABBREV_RE.search(before):
+            return False  # punto de fin de oración real → es prosa, no título
     return line[0].isupper() or line[0].isdigit()
+
 
 
 def guess_course_title(text: str, start: int, end: int) -> str:
@@ -442,7 +561,15 @@ class RobotsCache:
         rp = urllib.robotparser.RobotFileParser()
         rp.set_url(host + "/robots.txt")
         try:
-            rp.read()
+            resp = requests.get(
+                host + "/robots.txt",
+                timeout=(5, 8),  # (connect, read) — igual de estricto que crawler.py
+                headers={"User-Agent": self.user_agent},
+            )
+            if resp.status_code >= 400:
+                # Sin robots.txt (404) o inaccesible → fail open, como antes.
+                return None
+            rp.parse(resp.text.splitlines())
             return rp
         except Exception as e:
             if self._logger:

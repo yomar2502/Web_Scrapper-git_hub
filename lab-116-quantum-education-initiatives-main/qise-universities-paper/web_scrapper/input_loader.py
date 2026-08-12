@@ -1,19 +1,6 @@
 """
 input_loader.py — Load the university list from CSV or YAML into the internal
-`university` dict shape the crawler expects:
-
-    {
-      "name": str, "country": str, "country_code": str,
-      "base_url": str, "catalog_urls": [str, ...],
-      "type": "web", "language": str,
-      "max_pages": int|None, "max_depth": int|None,
-    }
-
-CSV is intentionally forgiving: column names are matched case-insensitively and
-by substring, so headers like "Institution", "University Name", "Website",
-"Domain", "Seed URLs", "Physics Dept URL", etc. all work. Any column whose name
-contains 'url', 'seed', 'catalog', 'dept', 'faculty', 'department', 'curricul'
-or 'malla' contributes seed URLs (semicolon/pipe/comma/newline separated).
+`university` dict shape the crawler expects.
 """
 
 import csv
@@ -25,7 +12,6 @@ from utils import normalize_url, get_logger
 
 logger = get_logger("input_loader")
 
-# Minimal country → ISO-3166 alpha-2 for Latin America (extend as needed).
 COUNTRY_TO_CODE = {
     "argentina": "AR", "bolivia": "BO", "brazil": "BR", "brasil": "BR",
     "chile": "CL", "colombia": "CO", "costa rica": "CR", "cuba": "CU",
@@ -42,10 +28,29 @@ _SEED_COL_HINTS = ("url", "seed", "catalog", "catálogo", "dept", "department",
 _SPLIT = re.compile(r"[;\|\n]+")
 
 
+# CAMBIO
+def _to_absolute_url(raw: str, base: str = "") -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    url = normalize_url(raw)
+    if url:
+        return url
+    if "/" not in raw and "." in raw and not raw.startswith("."):
+        url = normalize_url("https://" + raw)
+        if url:
+            return url
+    if base:
+        url = normalize_url(raw, base=base)
+        if url:
+            return url
+    return ""
+
+
 def load_universities(path: str) -> list[dict]:
     p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(f"Input file not found: {path}")
+    if not p.is_file():
+        raise FileNotFoundError(f"Input path does not exist or is not a file: {path}")
     suffix = p.suffix.lower()
     if suffix in (".yaml", ".yml"):
         unis = _load_yaml(p)
@@ -54,13 +59,36 @@ def load_universities(path: str) -> list[dict]:
     else:
         raise ValueError(f"Unsupported input format '{suffix}'. Use .csv or .yaml")
 
-    cleaned = [_finalize(u) for u in unis]
-    cleaned = [u for u in cleaned if u and u.get("catalog_urls")]
+
+    cleaned: list[dict] = []
+
+    for position, raw_university in enumerate(unis, start=1):
+        university = _finalize(raw_university)
+
+        if university is None:
+            if not isinstance(raw_university, dict):
+                reason = "entry is not a dictionary"
+            else:
+                reason = "missing university name"
+
+            logger.warning(
+                f"Skipped entry {position} from {path}: {reason}"
+            )  
+            continue
+
+        if not university.get("catalog_urls"):
+            logger.warning(
+                f"Skipped university '{university['name']}' from {path}: "
+                "no valid base_url or catalog_urls"
+            )
+            continue
+
+        cleaned.append(university)
+
+
     logger.info(f"Loaded {len(cleaned)} universities from {path}")
     return cleaned
 
-
-# ── YAML ──────────────────────────────────────────────────────────────────────
 
 def _load_yaml(p: Path) -> list[dict]:
     import yaml
@@ -73,12 +101,9 @@ def _load_yaml(p: Path) -> list[dict]:
     return data
 
 
-# ── CSV ───────────────────────────────────────────────────────────────────────
-
 def _load_csv(p: Path) -> list[dict]:
-    # Tolerate BOM and odd encodings common in exported spreadsheets.
     text = None
-    for enc in ("utf-8-sig", "utf-8", "latin-1", "cp1252"):
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
         try:
             text = p.read_text(encoding=enc)
             break
@@ -89,7 +114,7 @@ def _load_csv(p: Path) -> list[dict]:
 
     reader = csv.DictReader(text.splitlines())
     headers = reader.fieldnames or []
-    name_col = _find_col(headers, ["institution", "university", "name", "nombre"])
+    name_col = _find_col(headers, ["institution", "university", "universidad", "institución", "name", "nombre"],)
     country_col = _find_col(headers, ["country", "país", "pais"])
     code_col = _find_col(headers, ["country_code", "code", "iso"])
     base_col = _find_col(headers, ["website", "domain", "base_url", "url oficial",
@@ -103,26 +128,43 @@ def _load_csv(p: Path) -> list[dict]:
         raise ValueError(f"CSV needs an institution/name column. Found: {headers}")
 
     out: list[dict] = []
-    for row in reader:
+    for row_number, row in enumerate(reader, start=2):
         name = (row.get(name_col) or "").strip()
         if not name:
+            logger.warning(
+                f"Skipped CSV row {row_number} from {p}: "
+                "missing university name"
+            )
             continue
+        
+
         seeds: list[str] = []
-        base = (row.get(base_col) or "").strip() if base_col else ""
-        # Seed URLs are MANUAL only when they come from dedicated seed columns;
-        # the base/website column alone does not count (seed_origin tracking).
+
+        raw_base = (row.get(base_col) or "").strip() if base_col else ""
+        base = _to_absolute_url(raw_base)  # CAMBIO: antes normalize_url(raw_base) a secas
+
         for col in seed_cols:
             if col == base_col:
                 continue
+
             for piece in _SPLIT.split(row.get(col) or ""):
                 for sub in piece.split(","):
                     sub = sub.strip()
-                    if sub.startswith("http"):
-                        seeds.append(sub)
+
+                    if not sub:
+                        continue
+
+                    url = _to_absolute_url(sub, base=base)  # CAMBIO: antes solo normalize_url(sub)
+
+                    if url:
+                        seeds.append(url)
+
         has_manual = bool(seeds)
-        # the base/website doubles as a seed (first) either way
+
         if base and base not in seeds:
-            seeds.insert(0, base if base.startswith("http") else "https://" + base)
+            seeds.insert(0, base)
+        
+        
         out.append({
             "name": name,
             "country": (row.get(country_col) or "").strip() if country_col else "",
@@ -131,41 +173,72 @@ def _load_csv(p: Path) -> list[dict]:
             "catalog_urls": seeds,
             "has_manual_seeds": has_manual,
             "language": (row.get(lang_col) or "").strip() if lang_col else "",
-            "max_depth": _to_int(row.get(depth_col)) if depth_col else None,
-            "max_pages": _to_int(row.get(pages_col)) if pages_col else None,
+            "max_depth": _to_int(row.get(depth_col), minimum=0) if depth_col else None,
+            "max_pages": _to_int(row.get(pages_col), minimum=1) if pages_col else None,
         })
     return out
 
 
-# ── FINALIZE ──────────────────────────────────────────────────────────────────
-
 def _finalize(u: dict) -> dict | None:
     if not isinstance(u, dict):
         return None
+
     name = (u.get("name") or "").strip()
+
     if not name:
         return None
-    seeds = [normalize_url(s) for s in (u.get("catalog_urls") or []) if s]
-    seeds = [s for s in seeds if s]
 
-    # CSV loader sets this explicitly; YAML entries count as manual when they
-    # declare catalog_urls. The homepage fallback below is NOT manual.
-    has_manual = bool(u.get("has_manual_seeds", bool(seeds)))
+    base = _to_absolute_url(str(u.get("base_url") or ""))  # CAMBIO: antes normalize_url(...) a secas
 
-    base = (u.get("base_url") or "").strip()
-    if not base and seeds:
-        pu = urlparse(seeds[0])
-        base = f"{pu.scheme}://{pu.netloc}"
-    if base and not base.startswith("http"):
-        base = "https://" + base
-    # If no seeds but we have a base, crawl from the homepage.
+    raw_seeds = u.get("catalog_urls") or []
+
+    if isinstance(raw_seeds, str):
+        raw_seeds = [raw_seeds]
+
+    if not base:
+        for raw_seed in raw_seeds:
+            candidate = _to_absolute_url(str(raw_seed))  # CAMBIO: idem
+
+            if candidate:
+                parsed = urlparse(candidate)
+                base = normalize_url(
+                    f"{parsed.scheme}://{parsed.netloc}"
+                )
+                break
+
+    seeds: list[str] = []
+
+    for raw_seed in raw_seeds:
+        raw_seed = str(raw_seed).strip()
+
+        if not raw_seed:
+            continue
+
+        url = _to_absolute_url(raw_seed, base=base)  # CAMBIO: antes normalize_url + fallback manual
+
+        if url:
+            seeds.append(url)
+
+    seeds = list(dict.fromkeys(seeds))
+
+    has_manual = bool(
+        u.get("has_manual_seeds", bool(seeds))
+    )
+
     if not seeds and base:
-        seeds = [normalize_url(base)]
+        seeds = [base]
 
-    country = (u.get("country") or "").strip()
-    code = (u.get("country_code") or "").strip().upper()
-    if not code and country:
-        code = COUNTRY_TO_CODE.get(country.lower(), "")
+
+    country = str(u.get("country") or "").strip()
+    code = str(u.get("country_code") or "").strip().upper()
+
+    inferred_code = COUNTRY_TO_CODE.get(country.casefold(), "")
+
+    if inferred_code:
+        code = inferred_code
+    elif not re.fullmatch(r"[A-Z]{2}", code):
+        code = ""
+    
 
     return {
         "name": name,
@@ -176,21 +249,52 @@ def _finalize(u: dict) -> dict | None:
         "has_manual_seeds": has_manual,
         "type": u.get("type", "web"),
         "language": (u.get("language") or "").strip(),
-        "max_depth": u.get("max_depth"),
-        "max_pages": u.get("max_pages"),
+        "max_depth": _to_int(u.get("max_depth"), minimum=0),
+        "max_pages": _to_int(u.get("max_pages"), minimum=1),
     }
 
 
+
+def _normalize_header(text: str) -> str:
+    """Convierte encabezados distintos a una forma comparable."""
+    return re.sub(r"[\W_]+", " ", text.casefold()).strip()
+
+
 def _find_col(headers: list[str], candidates: list[str]) -> str | None:
-    for cand in candidates:
-        for h in headers:
-            if cand.lower() in h.lower():
-                return h
+    normalized_headers = [
+        (original, _normalize_header(original))
+        for original in headers
+    ]
+
+    for candidate in candidates:
+        normalized_candidate = _normalize_header(candidate)
+
+        for original, normalized_header in normalized_headers:
+            if normalized_header == normalized_candidate:
+                return original
+
+    for candidate in candidates:
+        normalized_candidate = _normalize_header(candidate)
+
+        if normalized_candidate in {"name", "nombre"}:
+            continue
+
+        for original, normalized_header in normalized_headers:
+            words = normalized_header.split()
+
+            if normalized_candidate in words:
+                return original
+
     return None
 
 
-def _to_int(v):
+def _to_int(value, minimum: int = 1) -> int | None:
     try:
-        return int(str(v).strip())
+        number = int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+    if number < minimum:
+        return None
+
+    return number
