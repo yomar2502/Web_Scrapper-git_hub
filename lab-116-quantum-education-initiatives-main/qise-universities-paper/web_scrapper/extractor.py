@@ -21,6 +21,27 @@ carries enough provenance to make a result auditable:
 PDF philosophy (the core fix): a PDF that we downloaded is NEVER silently
 dropped. If text extraction fails or returns almost nothing (scanned / image
 PDF), we still emit a fragment flagged for manual review.
+
+CORREGIDO — resumen de cambios (buscar "CAMBIO" para el detalle):
+  1. [BUG, confirmado con impacto real] extract_from_html(): el fragmento de
+     "página completa como un solo bloque" que se devuelve cuando NO se
+     detecta ningún bloque de curso (sin tablas, sin accordions/cards) no
+     llevaba coarse=True — a diferencia del catch_all, que sí lo lleva y por
+     la MISMA razón (mezcla muchos contextos). Sin la bandera, una mención
+     de paso en una página genérica se podía clasificar qise_core en vez de
+     unclear. Confirmado con un caso de prueba real (ver commit message /
+     conversación) antes y después del fix.
+  2. [LIMPIEZA, consistencia de esquema] extract_from_rss_entry(),
+     extract_from_tweet() y extract_from_reddit_post() construyen su dict de
+     salida a mano (no vía _make_fragment) y no incluían
+     "academic_level_hint" — presente en todo lo demás que produce el
+     extractor. extract_from_reddit_post() además no incluía "seed_origin"
+     (los otros dos sí). No es una causa de crash (el resto del pipeline usa
+     fragment.get(...) con default en todos los sitios que revisamos), pero
+     si algo en pipeline.py arma el CSV con una lista fija de columnas, una
+     fila con menos claves que las demás puede quedar con celdas vacías por
+     una razón distinta a la real (falta de dato) — así que se agregan por
+     consistencia.
 """
 
 import io
@@ -132,11 +153,16 @@ def extract_from_html(html: str, url: str, university: dict,
 
     if len(full_text) < 30:
         return []
-    return [_make_fragment(
+    # CAMBIO: este fragmento TAMBIÉN es la página completa como un
+    # solo bloque — la misma situación que catch_all arriba, y por la misma
+    # razón necesita coarse=True 
+    whole_page = _make_fragment(
         text=full_text, url=url, university=university, media_type="html",
         title=page_title, found_on_page=found_on_page,
         academic_level_hint=level_hint,
-    )]
+    )
+    whole_page["coarse"] = True
+    return [whole_page]
 
 
 # Classes that commonly wrap one course/subject entry, across the many CMS and
@@ -487,6 +513,9 @@ def extract_from_rss_entry(entry: Any, source_name: str) -> dict:
         "found_on_page": "",
         "pdf_url": "",
         "pdf_page": None,
+        # CAMBIO (limpieza #2): faltaba, presente en todo lo demás que
+        # produce el extractor (vía _make_fragment).
+        "academic_level_hint": "",
         "source_type": "news",
         "title": title[:200],
         "raw_text": full_text,
@@ -504,7 +533,9 @@ def extract_from_tweet(tweet: dict, query: str) -> dict:
     text = clean_course_text(tweet.get("text", ""))
     return {
         "media_type": "html", "source_url": f"https://twitter.com/i/web/status/{tweet.get('id', '')}",
-        "found_on_page": "", "pdf_url": "", "pdf_page": None, "source_type": "social",
+        "found_on_page": "", "pdf_url": "", "pdf_page": None,
+        "academic_level_hint": "",  # CAMBIO (limpieza #2)
+        "source_type": "social",
         "title": text[:120], "raw_text": text, "university": "", "country": "",
         "country_code": "", "language": detect_language(text),
         "extraction_status": "extracted",
@@ -517,9 +548,14 @@ def extract_from_reddit_post(post: dict, subreddit: str) -> dict:
     text = clean_course_text(f"{title}\n{post.get('selftext', '') or post.get('body', '')}")
     return {
         "media_type": "html", "source_url": post.get("url", ""), "found_on_page": "",
-        "pdf_url": "", "pdf_page": None, "source_type": "social", "title": title[:200],
+        "pdf_url": "", "pdf_page": None,
+        "academic_level_hint": "",  # CAMBIO (limpieza #2)
+        "source_type": "social", "title": title[:200],
         "raw_text": text, "university": "", "country": "", "country_code": "",
         "language": detect_language(text), "extraction_status": "extracted",
+        # CAMBIO (limpieza #2): faltaba por completo en esta función (las
+        # otras dos sí lo traían) — se agrega vacío por consistencia.
+        "seed_origin": "",
         "subreddit": subreddit,
     }
 
