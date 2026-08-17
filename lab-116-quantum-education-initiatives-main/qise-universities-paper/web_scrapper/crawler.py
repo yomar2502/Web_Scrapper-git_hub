@@ -1,15 +1,5 @@
 """
 crawler.py — Crawlers especializados por tipo de fuente.
-
-WebCrawler (portales universitarios):
-  - BFS por dominio con max_depth / max_pages configurables por universidad.
-  - Descubrimiento sensible a PDFs: los links a PDF NO se descartan por el
-    filtro de "basura"; se detectan por sufijo .pdf, por Content-Type y por
-    la cabecera de archivo %PDF (aunque la URL no termine en .pdf).
-  - Registra la página donde se encontró cada PDF (found_on_page).
-  - Respeta robots.txt (configurable, fail-open) y cachea descargas en disco
-    para que reejecuciones no vuelvan a golpear los servidores.
-  - User-Agent académico identificable.
 """
 
 import heapq
@@ -33,7 +23,6 @@ from utils import (
 
 logger = get_logger("crawler")
 
-# Identify ourselves honestly as an academic research crawler.
 ACADEMIC_UA = (
     "QISE-LatAm-Research-Bot/2.0 (academic research on quantum education; "
     "+contact via project README)"
@@ -66,19 +55,6 @@ def _make_session(user_agent: str, timeout: int, max_retries: int) -> requests.S
 
 
 class WebCrawler:
-    """
-    BFS crawler for university portals with PDF-sensitive discovery.
-
-    Discovery rules:
-      * Follow same-domain links whose URL/anchor looks like a course/program
-        page (COURSE_URL_PATTERNS), up to max_depth.
-      * ALWAYS collect PDF-looking links regardless of the junk filter — a PDF
-        under /media/, /download/ or a query-string endpoint is exactly what we
-        want. PDFs are fetched even at max_depth (they are documents, not
-        further crawl surface) but still count against max_pages.
-      * A response is a PDF if the Content-Type says so, the URL looks like a
-        PDF, OR the first bytes are the %PDF magic header.
-    """
 
     COURSE_URL_PATTERNS = re.compile(
         r"(curso|course|syllabus|silabo|s[íi]labo"
@@ -93,39 +69,42 @@ class WebCrawler:
         re.IGNORECASE,
     )
 
-    # Anchor text hints (checked on link TEXT, not URL) — catches "descargar malla".
     COURSE_ANCHOR_PATTERNS = re.compile(
         r"(malla|plan de estudio|pensum|s[íi]labo|syllabus|programa|curr[íi]cul"
         r"|grade curricular|matriz curricular|ementa|asignatura|disciplina|curso)",
         re.IGNORECASE,
     )
 
-    # URLs that very likely hold the actual curriculum. Crawled BEFORE generic
-    # course pages so a small max_pages budget is spent where the evidence is —
-    # a portal homepage can emit 80+ plausible links and starve the crawl.
     CURRICULUM_PRIORITY_PATTERNS = re.compile(
         r"(plan.?de.?estudio|malla|pensum|curricul|grade.?curricular"
         r"|matriz.?curricular|plano.?de.?ensino|silabo|s[íi]labo|syllabus"
-        r"|(?<![a-z])ementa|oferta.?academ|catalogo|catalog)",  # ementa needs a
-        re.IGNORECASE,  # boundary: it is a substring of "implementar"
+        r"|(?<![a-z])ementa|oferta.?academ|catalogo|catalog)",
+        re.IGNORECASE,
     )
 
     # Junk to NEVER queue: binary assets, auth/admin, per-user pages. Anything
     # merely off-topic (news, events, admissions…) is queued at LOW priority
     # instead — it may still hold contextual quantum evidence.
+    #
+    # CORREGIDO: "admin" y "cart" vivían dentro de la alternancia general sin
+    # ningún límite de fin de palabra/segmento — como el patrón solo exige un
+    # "/" ANTES de la palabra (no un límite DESPUÉS), "admin" y "cart" hacían
+    # match como simple PREFIJO de palabras reales completamente distintas:
+    # "/administracion" (carrera de Administración de Empresas, un programa
+    # académico real) y "/cartelera-de-eventos" (tablero de eventos) quedaban
+    # descartadas para siempre 
     HARD_SKIP_PATTERNS = re.compile(
         r"\.(jpg|jpeg|png|gif|svg|ico|mp4|mp3|zip|rar|exe|js|css"
         r"|woff|woff2|ttf|eot)(\?.*)?$"
-        r"|/(login|logout|admin|wp-admin|wp-login|search|tag|autor|author"
-        r"|comment|registro|register|password|reset|cart|shop"
+        r"|/(login|logout|wp-admin|wp-login|search|tag|autor|author"
+        r"|comment|registro|register|password|reset|shop"
         r"|contact|contacto|sitemap|privacidad|privacy|terminos|terms"
-        r"|rss|atom|newsletter|suscri)",
+        r"|rss|atom|newsletter|suscri)"
+        r"|/admin(?![a-z])"
+        r"|/cart(?![a-z])",
         re.IGNORECASE,
     )
 
-    # Crawled LAST (priority 4): news/events/admissions/people/etc. Not junk —
-    # contextual quantum evidence lives here — but they must not eat the page
-    # budget before curricula do.
     LOW_PRIORITY_URL_PATTERNS = re.compile(
         r"/(noticias?|news|blog|boletin|eventos?|events?|agenda|calendario"
         r"|prensa|press|comunicado|galeria|gallery"
@@ -147,14 +126,9 @@ class WebCrawler:
         self.use_cache = sc.get("use_cache", True)
         self.max_pdf_bytes = int(sc.get("max_pdf_mb", 40)) * 1024 * 1024
         self.max_pdfs_per_domain = int(sc.get("max_pdfs_per_domain", 50))
-        # Fetch documents embedded from Google Drive / SharePoint (documents
-        # only — those hosts are never crawled as pages).
         self.fetch_external_docs = sc.get("fetch_external_docs", True)
         self.user_agent = sc.get("user_agent") or ACADEMIC_UA
-        # Per-institution crawl statistics, read by the pipeline for the run
-        # summary: {institution: {pages_crawled, html_pages, pdfs_detected}}
         self.stats: dict[str, dict] = {}
-        # Subdomains seen during the current crawl (reset per institution).
         self._seen_hosts: set[str] = set()
 
         self.raw_dir = Path(cfg["output"]["raw_dir"])
@@ -165,20 +139,11 @@ class WebCrawler:
             self.user_agent, enabled=sc.get("respect_robots", True), logger=logger
         )
 
-    # ── PUBLIC ────────────────────────────────────────────────────────────────
-
     def crawl_university(self, university: dict) -> Generator[dict, None, None]:
         base = university.get("base_url") or (university.get("catalog_urls") or [""])[0]
-        # Scope the crawl to the institution's REGISTRABLE domain so sibling
-        # subdomains stay in bounds: PUCP links www.pucp.edu.pe →
-        # facultad-ciencias-ingenieria.pucp.edu.pe, UNI links portal.uni.edu.pe
-        # → fc.uni.edu.pe. Curricula usually live on faculty subdomains.
         allowed_domain = registered_domain(urlparse(base).netloc)
         seeds = [normalize_url(u) for u in university.get("catalog_urls", []) if u]
 
-        # Explicit None checks: the input loader stores max_pages/max_depth as
-        # None when the CSV has no such column, so dict.get(key, default)
-        # would return None instead of falling back to the global config.
         max_pages = university.get("max_pages")
         max_pages = self.global_max_pages if max_pages is None else max_pages
         max_depth = university.get("max_depth")
@@ -190,17 +155,6 @@ class WebCrawler:
         self.stats[university.get("name", "?")] = st
 
         visited: set[str] = set()
-        # Priority queue: (priority, seq, url, depth, found_on_page).
-        # 1 = PDF/document, 2 = STEM curriculum page, 3 = other curriculum,
-        # 4 = course/STEM/department page, 5 = news/events/admissions/people,
-        # 6 = generic. Low-priority pages are queued, not discarded — they may
-        # hold contextual quantum evidence — but only get budget after the
-        # academic pages. `seq` keeps insertion (BFS) order within a priority.
-        #
-        # Seeds are NOT all fetched first: they enter the same ranking, one
-        # level above what their URL alone would get. Otherwise 20 discovered
-        # seeds eat a small page budget before the crawl ever descends into a
-        # plan de estudios found on the very first seed.
         seq = itertools.count()
         queue: list[tuple[int, int, str, int, str]] = []
         for u in seeds:
@@ -212,8 +166,6 @@ class WebCrawler:
             queue.append((prio, next(seq), u, 0, ""))
         heapq.heapify(queue)
         pdf_cap_warned = False
-        # Reset per-crawl subdomain tracking (see _extract_links: the first
-        # link into each unseen faculty subdomain gets elevated priority).
         self._seen_hosts = {urlparse(u).netloc for u in seeds}
 
         logger.info(
@@ -268,19 +220,11 @@ class WebCrawler:
 
             scored_links, pdf_links = self._extract_links(html, url, allowed_domain)
 
-            # PDFs: fetch even at max_depth (documents, not crawl surface),
-            # but stop queueing once the per-domain PDF cap is reached.
             if self.download_pdfs and st["pdfs_detected"] < max_pdfs:
                 for link in pdf_links:
                     if link not in visited:
                         heapq.heappush(queue, (1, next(seq), link, depth + 1, url))
 
-            # HTML pages: only descend while there is depth budget. The
-            # priority (2..6) was computed from URL + anchor text, with the
-            # first link into each new subdomain elevated (see _extract_links).
-            # Depth is PER SITE: crossing into another subdomain restarts it —
-            # a faculty site reached at depth 2 is a whole new tree, and
-            # max_pages (not depth) is the real global cap.
             if depth < max_depth:
                 page_host = urlparse(url).netloc
                 for prio, link in scored_links:
@@ -296,24 +240,13 @@ class WebCrawler:
             f"({st['html_pages']} HTML, {st['pdfs_detected']} PDFs)"
         )
 
-    # ── FETCH (with on-disk cache) ────────────────────────────────────────────
-
     def _fetch(self, url: str, university: dict) -> dict | None:
-        """
-        Return a normalized dict, or None on failure:
-          {content: bytes, text: str, content_type: str, final_url: str,
-           is_pdf: bool, is_html: bool}
-        Uses the disk cache when enabled so re-runs don't re-hit servers.
-        """
         cached = self._load_cache(url, university)
         if cached is not None:
             return cached
 
         self.limiter.wait()
         try:
-            # (connect, read) timeout: dead hosts abort in seconds instead of
-            # holding the whole read timeout through every retry — university
-            # sites are full of stale links and each one costs wall-clock time.
             resp = self.session.get(url, timeout=(6, self.timeout),
                                     allow_redirects=True, stream=True)
             resp.raise_for_status()
@@ -334,9 +267,6 @@ class WebCrawler:
             return None
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as e:
-            # Old links on university pages often say http:// while the server
-            # only answers on https (PUCP's facultad links, for example).
-            # Browsers upgrade silently; do the same, once.
             if url.startswith("http://"):
                 https_url = "https://" + url[len("http://"):]
                 logger.info(f"  {type(e).__name__} on http, retrying https: {https_url}")
@@ -362,21 +292,16 @@ class WebCrawler:
             return True
         if looks_like_pdf_url(url):
             return True
-        # Magic header — handles PDFs served at extensionless URLs with a wrong
-        # or generic Content-Type (application/octet-stream, etc.).
         return content[:1024].lstrip()[:5] == b"%PDF-"
 
     @staticmethod
     def _is_spreadsheet(url: str, content_type: str, content: bytes) -> str:
-        """'xlsx' / 'xls' / '' — planes de estudio are often published as Excel."""
         path = urlparse(url.lower()).path
         if "spreadsheetml" in content_type or path.endswith(".xlsx"):
             return "xlsx"
         if "vnd.ms-excel" in content_type or path.endswith(".xls"):
             return "xls"
         if content[:4] == b"PK\x03\x04":
-            # OOXML is a zip; a workbook has entries under xl/. Reading the
-            # central directory is cheap and exact (entry order varies by writer).
             import io as _io
             import zipfile
             try:
@@ -386,7 +311,7 @@ class WebCrawler:
             except Exception:
                 pass
         if content[:4] == b"\xd0\xcf\x11\xe0":
-            return "xls"   # legacy OLE compound file
+            return "xls"
         return ""
 
     @staticmethod
@@ -401,8 +326,6 @@ class WebCrawler:
         return {"content": content, "text": text, "content_type": content_type,
                 "final_url": final_url, "is_pdf": is_pdf, "is_html": is_html,
                 "doc_kind": doc_kind}
-
-    # ── DISK CACHE (also serves as the raw archive for auditing) ──────────────
 
     def _cache_paths(self, url: str, university: dict) -> tuple[Path, Path]:
         slug = slugify(university.get("name") or "misc")
@@ -451,17 +374,8 @@ class WebCrawler:
         except Exception as e:
             logger.debug(f"cache write failed for {url}: {e}")
 
-    # ── LINK EXTRACTION ───────────────────────────────────────────────────────
-
     def _extract_links(self, html, base_url,
                        allowed_domain) -> tuple[list[tuple[int, str]], list[str]]:
-        """
-        Return (scored_links, pdf_links) for one HTML page.
-        scored_links = [(priority, url), ...] with priority 2 (curriculum),
-        3 (course/STEM/department), 4 (news/events/people…), 5 (generic) —
-        computed from BOTH the URL and the anchor text. PDF links bypass every
-        filter and are returned separately (fetched terminally at priority 1).
-        """
         try:
             from bs4 import BeautifulSoup
         except ImportError:
@@ -472,17 +386,12 @@ class WebCrawler:
         pdf_links: list[str] = []
         seen: set[str] = set()
 
-        # <a href> for navigation; <iframe>/<embed>/<object> because LatAm
-        # universities embed their planes de estudio as Drive previews or
-        # SharePoint spreadsheets rather than linking them.
         for el in soup.find_all(["a", "iframe", "embed", "object"]):
             raw = (el.get("href") or el.get("src") or el.get("data") or "").strip()
             if not raw or raw.startswith(("#", "mailto:", "tel:", "javascript:",
                                           "about:", "data:")):
                 continue
 
-            # External document hosts (Google Drive / SharePoint): fetched as
-            # documents, never crawled as pages — bypasses the domain rule.
             if self.fetch_external_docs and "://" in raw:
                 ext_url = external_doc_download_url(raw)
                 if ext_url:
@@ -501,10 +410,6 @@ class WebCrawler:
             anchor_text = el.get_text(" ", strip=True) if el.name == "a" else ""
             path_low = urlparse(full_url).path.lower()
 
-            # Document candidates: fetched terminally (even at max_depth) and
-            # NEVER dropped by the junk filter. Covers real .pdf/.xlsx links and
-            # extensionless "descargar malla/plan" download endpoints that often
-            # turn out to be PDFs (confirmed later via Content-Type/%PDF header).
             is_download = any(w in path_low for w in ("download", "descargar",
                                                       "documento", "archivo", "adjunto"))
             is_doc = (looks_like_pdf_url(full_url)
@@ -516,21 +421,13 @@ class WebCrawler:
                 continue
 
             if el.name != "a":
-                continue  # embedded non-document frames are not crawl surface
+                continue
 
             if self.HARD_SKIP_PATTERNS.search(path_low):
                 continue
 
             prio = self._link_priority(full_url, path_low, anchor_text)
 
-            # Faculty sites live on their own subdomains, often linked with
-            # opaque URLs (fc.uni.edu.pe/fc/) that would score priority 6 and
-            # never win budget. Elevate the FIRST link into each unseen
-            # subdomain: tier 2 when the host/anchor reads academic ("Facultad
-            # de Ciencias", ciencias.uni…) OR the host label is a short
-            # acronym — LatAm faculties are fc./fiee./fim./if. — tier 3
-            # otherwise, so junk hosts (bolsa de trabajo, CDNs) cannot
-            # displace curricula.
             host = urlparse(full_url).netloc
             if host not in self._seen_hosts:
                 self._seen_hosts.add(host)
@@ -548,17 +445,6 @@ class WebCrawler:
         return scored_links, pdf_links
 
     def _link_priority(self, url: str, path_low: str, anchor_text: str) -> int:
-        """
-        2 = STEM curriculum (plan de estudios/malla/… for física/ingeniería/…).
-        3 = other curriculum page. A big university links the planes of ALL its
-            carreras (sociología, comunicaciones, …); without the STEM split
-            those can drain the page budget before the física plan is reached.
-        4 = course / STEM / department / faculty page.
-        5 = news, events, admissions, people, sports… (contextual evidence only).
-        6 = generic institutional page (crawled last, never discarded).
-        Curriculum outranks the low-priority check on purpose: a plan-de-estudios
-        link is gold even when it sits under /noticias/.
-        """
         path_text = re.sub(r"[-_/.+%]+", " ", path_low)
         if (self.CURRICULUM_PRIORITY_PATTERNS.search(url)
                 or self.CURRICULUM_PRIORITY_PATTERNS.search(anchor_text)):
@@ -570,16 +456,11 @@ class WebCrawler:
         if (self.COURSE_URL_PATTERNS.search(url)
                 or self.COURSE_ANCHOR_PATTERNS.search(anchor_text)
                 or match_terms(path_text + " " + anchor_text, STEM_TERMS)):
-            # STEM-named program pages (/pregrado/fisica, /carrera/fisica)
-            # gate the plan pages — rank them with non-STEM curricula, above
-            # generic course/faculty pages.
             if match_terms(path_text + " " + anchor_text, STEM_TERMS):
                 return 3
             return 4
         return 6
 
-
-# ── RSS CRAWLER ───────────────────────────────────────────────────────────────
 
 class RSSCrawler:
     def __init__(self, cfg: dict):
@@ -610,8 +491,6 @@ class RSSCrawler:
                    "rss_source_name": source["name"]}
         logger.info(f"  RSS {source['name']}: {len(feed.entries)} entradas")
 
-
-# ── TWITTER CRAWLER ───────────────────────────────────────────────────────────
 
 class TwitterCrawler:
     def __init__(self, cfg: dict, bearer_token: str | None = None):
@@ -645,8 +524,6 @@ class TwitterCrawler:
         except Exception as e:
             logger.warning(f"Twitter API '{query}': {e}")
 
-
-# ── REDDIT CRAWLER ────────────────────────────────────────────────────────────
 
 class RedditCrawler:
     def __init__(self, cfg: dict, praw_cfg: dict | None = None):
