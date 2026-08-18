@@ -26,6 +26,9 @@ import json
 import re
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple, Any
+from dataclasses import dataclass, field
+from datetime import datetime
 
 import yaml
 
@@ -37,7 +40,9 @@ from utils import get_logger, truncate_text, now_iso, normalize_url
 
 logger = get_logger("pipeline")
 
-# Auditable output schema (column order).
+# ── CONSTANTS ──────────────────────────────────────────────────────────────────
+
+# Auditable output schema (column order)
 OUTPUT_FIELDS = [
     "timestamp",
     "institution",
@@ -64,7 +69,7 @@ OUTPUT_FIELDS = [
     "language",
 ]
 
-# Task-brief config key spellings accepted as aliases of the internal names.
+# Task-brief config key spellings accepted as aliases of the internal names
 _CONFIG_KEY_ALIASES = {
     "max_pages_per_domain": "max_pages_per_university",
     "request_delay_seconds": "request_delay_sec",
@@ -72,271 +77,525 @@ _CONFIG_KEY_ALIASES = {
     "respect_robots_txt": "respect_robots",
 }
 
+# Confidence ranking for deduplication
 _CONF_RANK = {"high": 3, "medium": 2, "low": 1, "": 0, None: 0}
+
+# Classification order for sorting
+_CLASS_ORDER = {
+    "qise_core": 0,
+    "quantum_foundations_or_adjacent": 1,
+    "unclear": 2,
+    "non_course_or_contextual": 3,
+}
 
 # Leading course-code token ("MF719 ", "FIS-410: ", "EE 80 ") — stripped from
 # the dedupe key so a catalog listing "Simetrías discretas" and its syllabus
-# page "MF719 Simetrías discretas" collapse into one row. Applied to folded
-# (lowercased) titles.
+# page "MF719 Simetrías discretas" collapse into one row.
 _COURSE_CODE_PREFIX = re.compile(r"^[a-z]{1,4}[- ]?\d{2,4}[a-z]?\b[\s.:–—-]*")
 
 
+# ── DATA CLASSES ──────────────────────────────────────────────────────────────
+
+@dataclass
+class PipelineConfig:
+    """Pipeline configuration."""
+    scraper: Dict[str, Any] = field(default_factory=dict)
+    output: Dict[str, Any] = field(default_factory=dict)
+    classifier: Dict[str, Any] = field(default_factory=dict)
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "PipelineConfig":
+        """Create PipelineConfig from dictionary."""
+        return cls(
+            scraper=data.get("scraper", {}),
+            output=data.get("output", {}),
+            classifier=data.get("classifier", {}),
+        )
+
+
+@dataclass
+class SummaryStats:
+    """Pipeline execution statistics."""
+    run_timestamp: str
+    elapsed_seconds: float
+    seeds_discovered: int = 0
+    pages_crawled: int = 0
+    pdfs_detected: int = 0
+    pdf_documents_processed: int = 0
+    pdf_documents_extracted: int = 0
+    fragments_processed: int = 0
+    candidate_rows: int = 0
+    rows_from_pdf: int = 0
+    rows_needing_manual_review: int = 0
+    by_classification: Dict[str, int] = field(default_factory=dict)
+    by_confidence: Dict[str, int] = field(default_factory=dict)
+    by_seed_origin: Dict[str, int] = field(default_factory=dict)
+    qise_core_rows: int = 0
+    institutions_with_qise_core: List[str] = field(default_factory=list)
+    countries_with_qise_core: List[str] = field(default_factory=list)
+    by_country: Dict[str, Dict] = field(default_factory=dict)
+    crawl_stats_per_institution: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "run_timestamp": self.run_timestamp,
+            "elapsed_seconds": self.elapsed_seconds,
+            "seeds_discovered": self.seeds_discovered,
+            "pages_crawled": self.pages_crawled,
+            "pdfs_detected": self.pdfs_detected,
+            "pdf_documents_processed": self.pdf_documents_processed,
+            "pdf_documents_extracted": self.pdf_documents_extracted,
+            "fragments_processed": self.fragments_processed,
+            "candidate_rows": self.candidate_rows,
+            "rows_from_pdf": self.rows_from_pdf,
+            "rows_needing_manual_review": self.rows_needing_manual_review,
+            "by_classification": self.by_classification,
+            "by_confidence": self.by_confidence,
+            "by_seed_origin": self.by_seed_origin,
+            "qise_core_rows": self.qise_core_rows,
+            "institutions_with_qise_core": self.institutions_with_qise_core,
+            "countries_with_qise_core": self.countries_with_qise_core,
+            "by_country": self.by_country,
+            "crawl_stats_per_institution": self.crawl_stats_per_institution,
+        }
+
+
+# ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
+
 def _title_key(title: str) -> str:
+    """
+    Generate a deduplication key from a course title.
+    
+    Strips course code prefixes (e.g., "MF719 ") and normalizes whitespace.
+    """
     t = _COURSE_CODE_PREFIX.sub("", fold(title or ""))
     return re.sub(r"\s+", " ", t).strip()
 
 
-class Pipeline:
+def _filter_by_country(universities: List[Dict], country: Optional[str]) -> List[Dict]:
+    """Filter universities by country."""
+    if not country:
+        return universities
+    
+    c = country.strip().lower()
+    return [
+        u for u in universities
+        if c in (u.get("country", "").lower(), u.get("country_code", "").lower())
+    ]
 
-    def __init__(self, config_path="config.yaml", input_path=None,
-                 sources_path=None, overrides=None):
+
+def _get_confidence_rank(confidence: str) -> int:
+    """Get numeric rank for confidence level."""
+    return _CONF_RANK.get(confidence, 0)
+
+
+# ── PIPELINE ──────────────────────────────────────────────────────────────────
+
+class Pipeline:
+    """
+    Main pipeline orchestrator for QISE-LatAm scraping.
+    
+    Coordinates:
+        1. Seed discovery
+        2. Web crawling
+        3. Content extraction
+        4. QISE classification
+        5. Deduplication
+        6. Output generation
+    """
+
+    def __init__(
+        self,
+        config_path: str = "config.yaml",
+        input_path: Optional[str] = None,
+        sources_path: Optional[str] = None,
+        overrides: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Initialize the pipeline.
+        
+        Args:
+            config_path: Path to configuration file
+            input_path: Path to input CSV/YAML
+            sources_path: Path to sources YAML
+            overrides: Configuration overrides
+        """
         logger.info("=" * 60)
         logger.info("QISE-LatAm-Scraper pipeline starting")
         logger.info("=" * 60)
 
-        with open(config_path, encoding="utf-8") as f:
-            self.cfg = yaml.safe_load(f) or {}
-        self.cfg.setdefault("scraper", {})
-        self.cfg.setdefault("output", {})
+        # Load configuration
+        self.cfg = self._load_config(config_path)
+        self._apply_overrides(overrides or {})
+        self._ensure_output_dirs()
 
-        # Accept alternative config key spellings (max_pages_per_domain,
-        # request_delay_seconds, …) as aliases of the internal names.
-        sc = self.cfg["scraper"]
+        # Load universities
+        self.universities = self._load_universities(input_path, sources_path)
+        
+        # Initialize classifier
+        self.classifier = QISEClassifier(self.cfg)
+        self._sources_path = sources_path
+
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """Load and normalize configuration."""
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        
+        # Set defaults
+        cfg.setdefault("scraper", {})
+        cfg.setdefault("output", {})
+        
+        # Apply key aliases
+        sc = cfg["scraper"]
         for alias, canonical in _CONFIG_KEY_ALIASES.items():
             if alias in sc and canonical not in sc:
                 sc[canonical] = sc[alias]
+        
+        return cfg
 
-        overrides = overrides or {}
-        for key in ("max_depth", "max_pages_per_university", "download_pdfs",
-                    "use_cache", "respect_robots", "request_delay_sec",
-                    "auto_discover_seeds"):
+    def _apply_overrides(self, overrides: Dict[str, Any]) -> None:
+        """Apply configuration overrides."""
+        sc = self.cfg["scraper"]
+        override_keys = [
+            "max_depth", "max_pages_per_university", "download_pdfs",
+            "use_cache", "respect_robots", "request_delay_sec",
+            "auto_discover_seeds", "min_seed_score", "max_auto_seeds_per_institution"
+        ]
+        
+        for key in override_keys:
             if overrides.get(key) is not None:
-                self.cfg["scraper"][key] = overrides[key]
+                sc[key] = overrides[key]
 
+    def _ensure_output_dirs(self) -> None:
+        """Create necessary output directories."""
+        output = self.cfg["output"]
         for dkey in ("raw_dir", "processed_dir", "log_dir"):
-            d = self.cfg["output"].get(dkey)
+            d = output.get(dkey)
             if d:
                 Path(d).mkdir(parents=True, exist_ok=True)
 
-        # Load universities: explicit --input wins, else sources.yaml.
+    def _load_universities(
+        self,
+        input_path: Optional[str],
+        sources_path: Optional[str]
+    ) -> List[Dict]:
+        """Load universities from input."""
         if input_path:
-            self.universities = load_universities(input_path)
+            return load_universities(input_path)
         elif sources_path and Path(sources_path).exists():
-            self.universities = load_universities(sources_path)
+            return load_universities(sources_path)
         else:
             raise FileNotFoundError(
                 "No input provided. Pass --input <file.csv|yaml> or keep sources.yaml."
             )
 
-        self.classifier = QISEClassifier(self.cfg)
-        self._sources_path = sources_path
-
     # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────
 
-    def run(self, output_path, dry_run=False, limit=None, country=None,
-            resume=False, include_news=False, include_social=False,
-            force_discover=False) -> dict:
+    def run(
+        self,
+        output_path: str,
+        dry_run: bool = False,
+        limit: Optional[int] = None,
+        country: Optional[str] = None,
+        resume: bool = False,
+        include_news: bool = False,
+        include_social: bool = False,
+        force_discover: bool = False,
+    ) -> SummaryStats:
+        """
+        Run the complete pipeline.
+        
+        Args:
+            output_path: Path for output CSV
+            dry_run: If True, don't write output
+            limit: Maximum fragments to process
+            country: Filter by country
+            resume: Resume from existing output
+            include_news: Include news sources
+            include_social: Include social media sources
+            force_discover: Force seed discovery for all institutions
+            
+        Returns:
+            Summary statistics
+        """
         start = time.time()
         ts = now_iso()
 
-        universities = self._filter_by_country(self.universities, country)
-        logger.info(f"Universities to process: {len(universities)}"
-                    + (f" (country={country})" if country else ""))
+        # Filter universities
+        universities = _filter_by_country(self.universities, country)
+        logger.info(
+            f"Universities to process: {len(universities)}"
+            + (f" (country={country})" if country else "")
+        )
 
-        # Resume: keep prior rows, skip institutions already in the output file.
-        existing_rows: list[dict] = []
-        done_institutions: set[str] = set()
-        out_path = Path(output_path)
-        if resume and out_path.exists():
-            existing_rows = self._read_existing(out_path)
-            done_institutions = {r.get("institution", "") for r in existing_rows}
-            universities = [u for u in universities
-                            if u["name"] not in done_institutions]
-            logger.info(f"Resume: {len(done_institutions)} institutions already done, "
-                        f"{len(universities)} remaining")
+        # Resume support
+        existing_rows, universities = self._handle_resume(
+            output_path, resume, universities
+        )
 
-        # Stage 1 — automatic seed discovery for institutions without manual
-        # seeds (all institutions when force_discover). Sets seed_origin on
-        # each university and writes data/processed/discovered_seeds.csv.
-        seeds_discovered = self._resolve_seeds(universities, dry_run=dry_run,
-                                               force=force_discover)
+        # Stage 1: Seed discovery
+        seeds_discovered = self._resolve_seeds(
+            universities,
+            dry_run=dry_run,
+            force=force_discover
+        )
 
+        # Stage 2: Crawl and classify
         sources = self._build_sources(universities, include_news, include_social)
         dispatcher = Dispatcher(self.cfg, sources)
+        
+        best, fragments_seen, pdf_stats = self._process_fragments(
+            dispatcher, universities, limit, ts
+        )
 
-        # source_url × semantic_category × course_title → best row so far.
-        # course_title is part of the key so distinct courses of the same
-        # category on one document (Mecánica Cuántica 1 / 2 / Relativista)
-        # each keep their own row.
-        best: dict[tuple, dict] = {}
-        fragments_seen = 0
-        pdf_docs_seen: set[str] = set()
-        pdf_docs_extracted: set[str] = set()
-
-        logger.info("Phase 1/2 — crawling, extracting, classifying...")
-        for fragment in dispatcher.stream_all_records():
-            fragments_seen += 1
-            if fragment.get("media_type") == "pdf":
-                pdf_docs_seen.add(fragment.get("source_url", ""))
-                if fragment.get("extraction_status") == "extracted":
-                    pdf_docs_extracted.add(fragment.get("source_url", ""))
-            if limit and fragments_seen > limit:
-                logger.info(f"Fragment limit reached ({limit}). Stopping.")
-                break
-
-            for cand in self.classifier.classify(fragment):
-                row = self._to_row(cand, ts)
-                key = (row["source_url"], row["semantic_category"],
-                       _title_key(row.get("course_title", "")))
-                prev = best.get(key)
-                if prev is None or _CONF_RANK[row["confidence"]] > _CONF_RANK[prev["confidence"]]:
-                    best[key] = row
-
-            if fragments_seen % 100 == 0:
-                logger.info(f"  {fragments_seen} fragments | {len(best)} candidate rows")
-
+        # Merge and deduplicate
         new_rows = list(best.values())
         all_rows = self._merge(existing_rows, new_rows)
-        logger.info(f"Phase 1/2 complete — {len(new_rows)} new candidate rows "
-                    f"({len(all_rows)} total)")
+        
+        logger.info(
+            f"Phase 1/2 complete — {len(new_rows)} new candidate rows "
+            f"({len(all_rows)} total)"
+        )
 
+        # Stage 3: Write output
         logger.info("Phase 2/2 — writing output...")
         if not dry_run:
-            self._write_csv(out_path, all_rows)
-            self._write_json(out_path.with_suffix(".json"), all_rows)
+            self._write_output(Path(output_path), all_rows)
 
-        crawl_stats = dict(dispatcher.web_crawler.stats)
-        summary = self._build_summary(all_rows, round(time.time() - start, 1),
-                                      fragments_seen, crawl_stats=crawl_stats,
-                                      seeds_discovered=seeds_discovered,
-                                      pdf_docs_seen=len(pdf_docs_seen),
-                                      pdf_docs_extracted=len(pdf_docs_extracted))
+        # Build and return summary
+        elapsed = round(time.time() - start, 1)
+        summary = self._build_summary(
+            all_rows,
+            elapsed,
+            fragments_seen,
+            dispatcher,
+            seeds_discovered,
+            pdf_stats,
+        )
+        
         self._print_summary(summary)
+        
         if not dry_run:
-            proc_dir = Path(self.cfg["output"].get("processed_dir", "data/processed"))
-            proc_dir.mkdir(parents=True, exist_ok=True)
-            (proc_dir / "run_summary.json").write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+            self._save_summary(summary)
+
         return summary
 
-    # ── STAGE 1: SEED RESOLUTION / DISCOVERY ──────────────────────────────────
+    # ── STAGE 1: SEED RESOLUTION ────────────────────────────────────────────
 
-    def _resolve_seeds(self, universities, dry_run=False, force=False) -> int:
+    def _resolve_seeds(
+        self,
+        universities: List[Dict],
+        dry_run: bool = False,
+        force: bool = False
+    ) -> int:
         """
-        Decide each university's seeds + seed_origin:
-          manual          — seed URLs came from the input file (untouched)
-          auto_discovered — no manual seeds; SeedDiscoverer found candidates
-          homepage_crawl  — no manual seeds and discovery found nothing (or is
-                            disabled): crawl starts at the homepage as before
-        With force=True, discovery runs for ALL institutions and discovered
-        seeds replace manual ones (for A/B-testing discovery quality).
-        Returns the number of discovered seeds; writes discovered_seeds.csv.
+        Resolve seeds for each university.
+        
+        Returns:
+            Number of auto-discovered seeds
         """
-        auto = self.cfg["scraper"].get("auto_discover_seeds", True)
+        # Set seed origin
         for u in universities:
-            u["seed_origin"] = ("manual" if u.get("has_manual_seeds")
-                                else "homepage_crawl")
-        targets = [u for u in universities
-                   if force or not u.get("has_manual_seeds")]
-        if not auto or not targets:
-            if targets:
-                logger.info(f"Seed discovery disabled — {len(targets)} "
-                            f"institution(s) will be crawled from the homepage")
+            u["seed_origin"] = (
+                "manual" if u.get("has_manual_seeds")
+                else "homepage_crawl"
+            )
+
+        # Determine which institutions need discovery
+        auto = self.cfg["scraper"].get("auto_discover_seeds", True)
+        targets = [
+            u for u in universities
+            if force or (not u.get("has_manual_seeds") and auto)
+        ]
+
+        if not targets:
+            if any(not u.get("has_manual_seeds") for u in universities):
+                logger.info("Seed discovery disabled — crawling from homepage")
             return 0
 
-        from seed_discovery import SeedDiscoverer  # late import (network module)
+        # Run discovery
+        from seed_discovery import SeedDiscoverer
+        
         discoverer = SeedDiscoverer(self.cfg)
-        all_candidates: list[dict] = []
+        all_candidates: List[Dict] = []
+        
         for u in targets:
             found = discoverer.discover(u)
             all_candidates.extend(found)
+            
             if found:
                 seeds = [f["seed_url"] for f in found]
                 base = normalize_url(u.get("base_url") or "")
-                u["catalog_urls"] = seeds + ([base] if base and base not in seeds
-                                             else [])
+                
+                # Combine discovered seeds with base URL
+                u["catalog_urls"] = seeds + (
+                    [base] if base and base not in seeds else []
+                )
                 u["seed_origin"] = "auto_discovered"
             elif not u.get("has_manual_seeds"):
                 u["seed_origin"] = "homepage_crawl"
-            # force + nothing found + manual seeds present → keep manual.
 
+        # Write discovered seeds
         if not dry_run:
             self._write_discovered_seeds(all_candidates)
+
+        # Log seed origins
         origins = {}
         for u in universities:
-            origins[u["seed_origin"]] = origins.get(u["seed_origin"], 0) + 1
-        logger.info(f"Seed resolution: {origins} | "
-                    f"{len(all_candidates)} seeds auto-discovered")
+            origin = u["seed_origin"]
+            origins[origin] = origins.get(origin, 0) + 1
+        
+        logger.info(f"Seed resolution: {origins} | {len(all_candidates)} seeds discovered")
         return len(all_candidates)
 
-    def _write_discovered_seeds(self, candidates: list[dict]) -> None:
+    def _write_discovered_seeds(self, candidates: List[Dict]) -> None:
+        """Write discovered seeds to CSV."""
         if not candidates:
             return
+
         proc_dir = Path(self.cfg["output"].get("processed_dir", "data/processed"))
         proc_dir.mkdir(parents=True, exist_ok=True)
+        
         path = proc_dir / "discovered_seeds.csv"
-        fields = ["institution", "seed_url", "source", "score",
-                  "matched_terms", "reason"]
+        fields = ["institution", "seed_url", "source", "score", "matched_terms", "reason"]
+        
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             w.writerows(candidates)
+        
         logger.info(f"Discovered seeds written → {path} ({len(candidates)} rows)")
 
-    def discover_only(self, country=None, force=False) -> int:
+    # ── STAGE 2: FRAGMENT PROCESSING ───────────────────────────────────────
+
+    def _process_fragments(
+        self,
+        dispatcher: Dispatcher,
+        universities: List[Dict],
+        limit: Optional[int],
+        timestamp: str,
+    ) -> Tuple[Dict[Tuple, Dict], int, Dict[str, int]]:
         """
-        --discover-seeds-only: run Stage 1 for every institution without manual
-        seeds (all of them with force=True), print the results, write
-        discovered_seeds.csv, and return the number of discovered seeds —
-        without crawling anything else.
+        Process fragments from the dispatcher.
+        
+        Returns:
+            Tuple of (best_rows, fragments_seen, pdf_stats)
         """
-        from seed_discovery import SeedDiscoverer
-        universities = self._filter_by_country(self.universities, country)
-        discoverer = SeedDiscoverer(self.cfg)
-        all_candidates: list[dict] = []
-        for u in universities:
-            if u.get("has_manual_seeds") and not force:
-                logger.info(f"{u['name']}: manual seeds present "
-                            f"({len(u.get('catalog_urls') or [])}) — skipping "
-                            f"discovery (use --force-discover to override)")
-                continue
-            all_candidates.extend(discoverer.discover(u))
-        self._write_discovered_seeds(all_candidates)
-        logger.info(f"Seed discovery complete: {len(all_candidates)} seeds "
-                    f"across {len({c['institution'] for c in all_candidates})} "
-                    f"institution(s)")
-        return len(all_candidates)
+        best: Dict[Tuple, Dict] = {}
+        fragments_seen = 0
+        pdf_docs_seen: Set[str] = set()
+        pdf_docs_extracted: Set[str] = set()
+        pdf_url_to_country: Dict[str, str] = {}
 
-    # ── HELPERS ───────────────────────────────────────────────────────────────
+        logger.info("Phase 1/2 — crawling, extracting, classifying...")
 
-    @staticmethod
-    def _filter_by_country(universities, country):
-        if not country:
-            return universities
-        c = country.strip().lower()
-        return [u for u in universities
-                if c in (u.get("country", "").lower(), u.get("country_code", "").lower())]
+        for fragment in dispatcher.stream_all_records():
+            fragments_seen += 1
+            
+            # Track PDF stats
+            if fragment.get("media_type") == "pdf":
+                url = fragment.get("source_url", "")
+                pdf_docs_seen.add(url)
+                if fragment.get("extraction_status") == "extracted":
+                    pdf_docs_extracted.add(url)
+                
+                # Store country for PDFs
+                country = fragment.get("country") or fragment.get("university_country", "")
+                if country:
+                    pdf_url_to_country[url] = country
 
-    def _build_sources(self, universities, include_news, include_social) -> dict:
+            # Apply limit
+            if limit and fragments_seen > limit:
+                logger.info(f"Fragment limit reached ({limit}). Stopping.")
+                break
+
+            # Classify and deduplicate
+            for cand in self.classifier.classify(fragment):
+                row = self._to_row(cand, timestamp)
+                
+                # Generate dedupe key
+                key = (
+                    row["source_url"],
+                    row["semantic_category"],
+                    _title_key(row.get("course_title", ""))
+                )
+                
+                # Keep best confidence
+                prev = best.get(key)
+                if prev is None or _get_confidence_rank(row["confidence"]) > _get_confidence_rank(prev["confidence"]):
+                    best[key] = row
+
+            # Progress logging
+            if fragments_seen % 100 == 0:
+                logger.info(f"  {fragments_seen} fragments | {len(best)} candidate rows")
+
+        return best, fragments_seen, {
+            "pdf_docs_seen": len(pdf_docs_seen),
+            "pdf_docs_extracted": len(pdf_docs_extracted),
+            "pdf_url_to_country": pdf_url_to_country,
+        }
+
+    # ── HELPERS ──────────────────────────────────────────────────────────────
+
+    def _handle_resume(
+        self,
+        output_path: str,
+        resume: bool,
+        universities: List[Dict]
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Handle resume logic."""
+        existing_rows = []
+        out_path = Path(output_path)
+        
+        if resume and out_path.exists():
+            existing_rows = self._read_existing(out_path)
+            done_institutions = {r.get("institution", "") for r in existing_rows}
+            
+            remaining = [
+                u for u in universities
+                if u["name"] not in done_institutions
+            ]
+            
+            logger.info(
+                f"Resume: {len(done_institutions)} institutions already done, "
+                f"{len(remaining)} remaining"
+            )
+            return existing_rows, remaining
+        
+        return existing_rows, universities
+
+    def _build_sources(
+        self,
+        universities: List[Dict],
+        include_news: bool,
+        include_social: bool
+    ) -> Dict[str, List]:
+        """Build sources configuration for dispatcher."""
         sources = {"universities": universities}
-        if (include_news or include_social) and self._sources_path \
-                and Path(self._sources_path).exists() \
-                and Path(self._sources_path).suffix.lower() in (".yaml", ".yml"):
-            try:
-                with open(self._sources_path, encoding="utf-8") as f:
-                    extra = yaml.safe_load(f) or {}
-                if include_news:
-                    sources["news_sources"] = extra.get("news_sources", [])
-                if include_social:
-                    sources["social_sources"] = extra.get("social_sources", [])
-            except Exception as e:
-                logger.warning(f"Could not load extra sources: {e}")
+        
+        if (include_news or include_social) and self._sources_path:
+            if Path(self._sources_path).exists():
+                try:
+                    with open(self._sources_path, encoding="utf-8") as f:
+                        extra = yaml.safe_load(f) or {}
+                    
+                    if include_news:
+                        sources["news_sources"] = extra.get("news_sources", [])
+                    if include_social:
+                        sources["social_sources"] = extra.get("social_sources", [])
+                        
+                except Exception as e:
+                    logger.warning(f"Could not load extra sources: {e}")
+        
         return sources
 
     @staticmethod
-    def _to_row(cand: dict, ts: str) -> dict:
+    def _to_row(cand: Dict, ts: str) -> Dict:
+        """Convert a candidate to an output row."""
         classification = cand.get("classification", "unclear")
         pdf_page = cand.get("pdf_page")
+        
         return {
             "timestamp": ts,
             "institution": cand.get("university", ""),
@@ -356,7 +615,7 @@ class Pipeline:
             "media_type": cand.get("media_type", ""),
             "source_url": cand.get("source_url", ""),
             "pdf_url": cand.get("pdf_url", ""),
-            "pdf_page": "" if pdf_page is None else pdf_page,
+            "pdf_page": "" if pdf_page is None else str(pdf_page),
             "found_on_page": cand.get("found_on_page", ""),
             "seed_origin": cand.get("seed_origin", ""),
             "extraction_status": cand.get("extraction_status", "extracted"),
@@ -364,19 +623,26 @@ class Pipeline:
         }
 
     @staticmethod
-    def _merge(existing: list[dict], new: list[dict]) -> list[dict]:
-        by_key: dict[tuple, dict] = {}
+    def _merge(existing: List[Dict], new: List[Dict]) -> List[Dict]:
+        """Merge existing and new rows with deduplication."""
+        by_key: Dict[Tuple, Dict] = {}
+        
         for r in existing + new:
-            key = (r.get("source_url", ""), r.get("semantic_category", ""),
-                   _title_key(r.get("course_title", "")))
+            key = (
+                r.get("source_url", ""),
+                r.get("semantic_category", ""),
+                _title_key(r.get("course_title", ""))
+            )
+            
             prev = by_key.get(key)
-            if prev is None or _CONF_RANK.get(r.get("confidence")) \
-                    >= _CONF_RANK.get(prev.get("confidence")):
+            if prev is None or _get_confidence_rank(r.get("confidence")) >= _get_confidence_rank(prev.get("confidence")):
                 by_key[key] = r
+        
         return list(by_key.values())
 
     @staticmethod
-    def _read_existing(path: Path) -> list[dict]:
+    def _read_existing(path: Path) -> List[Dict]:
+        """Read existing output CSV for resume."""
         try:
             with open(path, encoding="utf-8") as f:
                 return list(csv.DictReader(f))
@@ -384,120 +650,237 @@ class Pipeline:
             logger.warning(f"Could not read existing output for resume: {e}")
             return []
 
+    # ── OUTPUT ───────────────────────────────────────────────────────────────
+
+    def _write_output(self, path: Path, rows: List[Dict]) -> None:
+        """Write output CSV and JSON files."""
+        # Sort for reviewer-friendly output
+        sorted_rows = sorted(
+            rows,
+            key=lambda r: (
+                r.get("institution", ""),
+                _CLASS_ORDER.get(r.get("classification"), 9),
+                -_get_confidence_rank(r.get("confidence", "")),
+            )
+        )
+        
+        self._write_csv(path, sorted_rows)
+        self._write_json(path.with_suffix(".json"), sorted_rows)
+
     @staticmethod
-    def _write_csv(path: Path, rows: list[dict]) -> None:
+    def _write_csv(path: Path, rows: List[Dict]) -> None:
+        """Write CSV output."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Sort for stable, reviewer-friendly output.
-        order = {"qise_core": 0, "quantum_foundations_or_adjacent": 1,
-                 "unclear": 2, "non_course_or_contextual": 3}
-        rows = sorted(rows, key=lambda r: (
-            r.get("institution", ""),
-            order.get(r.get("classification"), 9),
-            -_CONF_RANK.get(r.get("confidence"), 0),
-        ))
+        
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
+        
         logger.info(f"Wrote {len(rows)} rows → {path}")
 
     @staticmethod
-    def _write_json(path: Path, rows: list[dict]) -> None:
-        path.write_text(json.dumps(rows, indent=2, ensure_ascii=False),
-                        encoding="utf-8")
+    def _write_json(path: Path, rows: List[Dict]) -> None:
+        """Write JSON output."""
+        path.write_text(
+            json.dumps(rows, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
 
-    # ── SUMMARY ───────────────────────────────────────────────────────────────
+    def _save_summary(self, summary: SummaryStats) -> None:
+        """Save summary to JSON."""
+        proc_dir = Path(self.cfg["output"].get("processed_dir", "data/processed"))
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        
+        summary_path = proc_dir / "run_summary.json"
+        summary_path.write_text(
+            json.dumps(summary.to_dict(), indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
 
-    def _build_summary(self, rows, elapsed, fragments_seen, crawl_stats=None,
-                       seeds_discovered=0, pdf_docs_seen=0,
-                       pdf_docs_extracted=0) -> dict:
-        by_class: dict[str, int] = {}
-        by_conf: dict[str, int] = {}
+    # ── SUMMARY ─────────────────────────────────────────────────────────────
+
+    def _build_summary(
+        self,
+        rows: List[Dict],
+        elapsed: float,
+        fragments_seen: int,
+        dispatcher: Dispatcher,
+        seeds_discovered: int,
+        pdf_stats: Dict[str, Any],
+    ) -> SummaryStats:
+        """Build summary statistics."""
+        by_class: Dict[str, int] = {}
+        by_conf: Dict[str, int] = {}
+        
         for r in rows:
-            by_class[r["classification"]] = by_class.get(r["classification"], 0) + 1
-            by_conf[r["confidence"]] = by_conf.get(r["confidence"], 0) + 1
+            cls = r.get("classification", "unclear")
+            by_class[cls] = by_class.get(cls, 0) + 1
+            
+            conf = r.get("confidence", "unknown")
+            by_conf[conf] = by_conf.get(conf, 0) + 1
 
-        # QISE availability variable computed ONLY from qise_core (per the brief).
+        # QISE core analysis
         qise_core = [r for r in rows if r.get("classification") == "qise_core"]
-        institutions_with_core = sorted({r["institution"] for r in qise_core
-                                         if r["institution"]})
-        countries_with_core = sorted({r["country_code"] for r in qise_core
-                                      if r["country_code"]})
+        institutions_with_core = sorted({
+            r["institution"] for r in qise_core
+            if r.get("institution")
+        })
+        countries_with_core = sorted({
+            r["country_code"] for r in qise_core
+            if r.get("country_code")
+        })
 
-        by_country: dict[str, dict] = {}
+        # Country breakdown
+        by_country: Dict[str, Dict] = {}
         for r in rows:
             code = r.get("country_code") or "??"
-            b = by_country.setdefault(code, {"rows": 0, "qise_core": 0,
-                                             "institutions": set(),
-                                             "institutions_with_core": set()})
+            b = by_country.setdefault(code, {
+                "rows": 0,
+                "qise_core": 0,
+                "institutions": set(),
+                "institutions_with_core": set()
+            })
             b["rows"] += 1
-            if r["institution"]:
+            if r.get("institution"):
                 b["institutions"].add(r["institution"])
-            if r["classification"] == "qise_core":
+            if r.get("classification") == "qise_core":
                 b["qise_core"] += 1
-                if r["institution"]:
+                if r.get("institution"):
                     b["institutions_with_core"].add(r["institution"])
-        for b in by_country.values():
+
+        # Convert sets to lengths/lists
+        for code, b in by_country.items():
             b["institutions"] = len(b["institutions"])
             b["institutions_with_core"] = sorted(b["institutions_with_core"])
 
-        manual_review = sum(1 for r in rows
-                            if r.get("extraction_status") != "extracted")
+        # PDF statistics
         pdf_rows = sum(1 for r in rows if r.get("media_type") == "pdf")
+        manual_review = sum(
+            1 for r in rows
+            if r.get("extraction_status") != "extracted"
+        )
 
-        by_seed_origin: dict[str, int] = {}
+        # Seed origin breakdown
+        by_seed_origin: Dict[str, int] = {}
         for r in rows:
-            so = r.get("seed_origin") or ""
-            by_seed_origin[so] = by_seed_origin.get(so, 0) + 1
+            origin = r.get("seed_origin") or ""
+            by_seed_origin[origin] = by_seed_origin.get(origin, 0) + 1
 
-        crawl_stats = crawl_stats or {}
+        # Crawl statistics
+        crawl_stats = dispatcher.web_crawler.stats if hasattr(dispatcher, "web_crawler") else {}
         pages_crawled = sum(s.get("pages_crawled", 0) for s in crawl_stats.values())
         pdfs_detected = sum(s.get("pdfs_detected", 0) for s in crawl_stats.values())
 
-        return {
-            "run_timestamp": now_iso(),
-            "elapsed_seconds": elapsed,
-            "seeds_discovered": seeds_discovered,
-            "pages_crawled": pages_crawled,
-            "pdfs_detected": pdfs_detected,
-            "pdf_documents_processed": pdf_docs_seen,
-            "pdf_documents_extracted": pdf_docs_extracted,
-            "fragments_processed": fragments_seen,
-            "candidate_rows": len(rows),
-            "rows_from_pdf": pdf_rows,
-            "rows_needing_manual_review": manual_review,
-            "by_classification": by_class,
-            "by_confidence": by_conf,
-            "by_seed_origin": by_seed_origin,
-            "qise_core_rows": len(qise_core),
-            "institutions_with_qise_core": institutions_with_core,
-            "countries_with_qise_core": countries_with_core,
-            "by_country": by_country,
-            "crawl_stats_per_institution": crawl_stats,
-        }
+        return SummaryStats(
+            run_timestamp=now_iso(),
+            elapsed_seconds=elapsed,
+            seeds_discovered=seeds_discovered,
+            pages_crawled=pages_crawled,
+            pdfs_detected=pdfs_detected,
+            pdf_documents_processed=pdf_stats.get("pdf_docs_seen", 0),
+            pdf_documents_extracted=pdf_stats.get("pdf_docs_extracted", 0),
+            fragments_processed=fragments_seen,
+            candidate_rows=len(rows),
+            rows_from_pdf=pdf_rows,
+            rows_needing_manual_review=manual_review,
+            by_classification=by_class,
+            by_confidence=by_conf,
+            by_seed_origin=by_seed_origin,
+            qise_core_rows=len(qise_core),
+            institutions_with_qise_core=institutions_with_core,
+            countries_with_qise_core=countries_with_core,
+            by_country=by_country,
+            crawl_stats_per_institution=crawl_stats,
+        )
 
     @staticmethod
-    def _print_summary(s: dict) -> None:
+    def _print_summary(summary: SummaryStats) -> None:
+        """Print summary to console."""
         logger.info("=" * 60)
         logger.info("PIPELINE COMPLETE")
-        logger.info(f"  Seeds discovered    : {s.get('seeds_discovered', 0)}")
-        logger.info(f"  Pages crawled       : {s.get('pages_crawled', 0)}")
-        logger.info(f"  PDFs detected       : {s.get('pdfs_detected', 0)}")
-        logger.info(f"  PDFs extracted OK   : {s.get('pdf_documents_extracted', 0)}"
-                    f"/{s.get('pdf_documents_processed', 0)}")
-        logger.info(f"  Fragments processed : {s['fragments_processed']}")
-        logger.info(f"  Candidate rows      : {s['candidate_rows']}")
-        logger.info(f"  From PDFs           : {s['rows_from_pdf']}")
-        logger.info(f"  Need manual review  : {s['rows_needing_manual_review']}")
-        logger.info(f"  By seed origin      : {s.get('by_seed_origin', {})}")
-        logger.info(f"  Elapsed             : {s['elapsed_seconds']}s")
+        logger.info(f"  Seeds discovered    : {summary.seeds_discovered}")
+        logger.info(f"  Pages crawled       : {summary.pages_crawled}")
+        logger.info(f"  PDFs detected       : {summary.pdfs_detected}")
+        logger.info(f"  PDFs extracted OK   : {summary.pdf_documents_extracted}/{summary.pdf_documents_processed}")
+        logger.info(f"  Fragments processed : {summary.fragments_processed}")
+        logger.info(f"  Candidate rows      : {summary.candidate_rows}")
+        logger.info(f"  From PDFs           : {summary.rows_from_pdf}")
+        logger.info(f"  Need manual review  : {summary.rows_needing_manual_review}")
+        logger.info(f"  By seed origin      : {summary.by_seed_origin}")
+        logger.info(f"  Elapsed             : {summary.elapsed_seconds}s")
         logger.info("-" * 60)
         logger.info("  By classification:")
-        for k, v in sorted(s["by_classification"].items()):
+        for k, v in sorted(summary.by_classification.items()):
             logger.info(f"    {k:<34s}: {v}")
         logger.info("-" * 60)
-        logger.info(f"  qise_core rows      : {s['qise_core_rows']}")
-        logger.info(f"  Institutions w/ core: {len(s['institutions_with_qise_core'])}")
-        for name in s["institutions_with_qise_core"]:
+        logger.info(f"  qise_core rows      : {summary.qise_core_rows}")
+        logger.info(f"  Institutions w/ core: {len(summary.institutions_with_qise_core)}")
+        for name in summary.institutions_with_qise_core[:10]:
             logger.info(f"      • {name}")
+        if len(summary.institutions_with_qise_core) > 10:
+            logger.info(f"      ... and {len(summary.institutions_with_qise_core) - 10} more")
         logger.info("=" * 60)
+
+    # ── DISCOVER-ONLY MODE ──────────────────────────────────────────────────
+
+    def discover_only(self, country: Optional[str] = None, force: bool = False) -> int:
+        """
+        Run seed discovery only, without crawling.
+        
+        Returns:
+            Number of discovered seeds
+        """
+        from seed_discovery import SeedDiscoverer
+        
+        universities = _filter_by_country(self.universities, country)
+        discoverer = SeedDiscoverer(self.cfg)
+        all_candidates: List[Dict] = []
+
+        for u in universities:
+            has_manual = u.get("has_manual_seeds", False)
+            
+            if has_manual and not force:
+                logger.info(
+                    f"{u['name']}: manual seeds present "
+                    f"({len(u.get('catalog_urls') or [])}) — skipping "
+                    f"(use --force-discover to override)"
+                )
+                continue
+
+            candidates = discoverer.discover(u)
+            all_candidates.extend(candidates)
+
+        self._write_discovered_seeds(all_candidates)
+
+        institutions = len({c["institution"] for c in all_candidates})
+        logger.info(
+            f"Seed discovery complete: {len(all_candidates)} seeds "
+            f"across {institutions} institution(s)"
+        )
+
+        return len(all_candidates)
+
+
+# ── CONVENIENCE FUNCTIONS ──────────────────────────────────────────────────
+
+def run_pipeline(
+    config_path: str = "config.yaml",
+    input_path: Optional[str] = None,
+    output_path: str = "data/processed/qise_candidates.csv",
+    **kwargs
+) -> SummaryStats:
+    """
+    Convenience function to run the pipeline.
+    
+    Args:
+        config_path: Path to configuration file
+        input_path: Path to input CSV/YAML
+        output_path: Path for output CSV
+        **kwargs: Additional arguments for Pipeline.run()
+        
+    Returns:
+        Summary statistics
+    """
+    pipeline = Pipeline(config_path, input_path)
+    return pipeline.run(output_path, **kwargs)
