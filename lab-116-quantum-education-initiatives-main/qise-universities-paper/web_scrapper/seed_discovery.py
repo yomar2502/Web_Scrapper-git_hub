@@ -1,24 +1,3 @@
-"""
-seed_discovery.py — Stage 1: automatic seed discovery.
-
-Given a university's main domain, discover a small set of high-value seed URLs
-likely to hold course catalogs, curricula (mallas / planes de estudio / grades
-curriculares), syllabi, faculties/departments or curriculum PDFs — so that
-`seed_urls` in the input CSV becomes optional.
-
-Discovery sources, in order:
-  1. homepage internal links (URL + anchor text)
-  2. robots.txt  (both as a politeness check and for `Sitemap:` declarations)
-  3. sitemap.xml + any sitemaps declared in robots.txt (1 level of index
-     recursion, capped)
-
-Every candidate URL is scored with the multilingual academic/STEM term lists in
-keywords.py; only the top `max_auto_seeds_per_institution` (config) survive.
-All fetches are rate-limited, size-capped and robots-respecting, and every
-failure fails SOFT: an empty result simply means the pipeline falls back to a
-plain homepage crawl (`seed_origin=homepage_crawl`).
-"""
-
 import gzip
 import re
 from urllib.parse import urlparse, unquote
@@ -36,31 +15,22 @@ from utils import (
 
 logger = get_logger("seed_discovery")
 
-# Bounds so discovery can never blow up on a pathological site.
-MAX_FETCH_BYTES = 5 * 1024 * 1024      # per fetched document
-MAX_SITEMAP_FETCHES = 6                # sitemap files per institution
-MAX_CHILD_SITEMAPS = 5                 # children followed per sitemap index
+MAX_FETCH_BYTES = 5 * 1024 * 1024
+MAX_SITEMAP_FETCHES = 6
+MAX_CHILD_SITEMAPS = 5
 MAX_URLS_PER_SITEMAP = 3000
-MAX_CANDIDATES = 8000                  # scored URLs per institution
+MAX_CANDIDATES = 8000
 
 _LOC_RE = re.compile(r"<loc>\s*(.*?)\s*</loc>", re.IGNORECASE | re.DOTALL)
 _SITEMAP_DECL_RE = re.compile(r"^\s*sitemap\s*:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
-# Turn URL separators into spaces so "plan-de-estudios" matches "plan de estudios".
 _URL_SEPARATORS = re.compile(r"[-_/.+%?=&#]+")
 
 
-# ── PURE HELPERS (offline-testable) ───────────────────────────────────────────
-
 def parse_robots_sitemaps(robots_txt: str) -> list[str]:
-    """Sitemap URLs declared in a robots.txt body."""
     return [m.group(1).strip() for m in _SITEMAP_DECL_RE.finditer(robots_txt or "")]
 
 
 def parse_sitemap(xml_text: str) -> tuple[list[str], list[str]]:
-    """
-    Return (page_urls, child_sitemap_urls) from a sitemap or sitemap-index body.
-    Regex-based on <loc> so XML namespaces/malformed markup can't break it.
-    """
     urls: list[str] = []
     children: list[str] = []
     for loc in _LOC_RE.findall(xml_text or ""):
@@ -79,10 +49,6 @@ def parse_sitemap(xml_text: str) -> tuple[list[str], list[str]]:
 
 def score_candidate(url: str, anchor: str = "",
                     in_sitemap: bool = False) -> tuple[int, list[str], str]:
-    """
-    Score one candidate seed URL. Returns (score, matched_terms, reason).
-    Transparent additive rules so every selection is explainable in the log/CSV.
-    """
     parsed = urlparse(url)
     url_text = _URL_SEPARATORS.sub(" ", unquote(parsed.path + " " + parsed.query))
     anchor = (anchor or "").strip()
@@ -127,8 +93,6 @@ def score_candidate(url: str, anchor: str = "",
     return score, matched, " + ".join(parts) or "no term matches"
 
 
-# ── DISCOVERER ────────────────────────────────────────────────────────────────
-
 class SeedDiscoverer:
 
     def __init__(self, cfg: dict):
@@ -143,14 +107,7 @@ class SeedDiscoverer:
         self.session = requests.Session()
         self.session.headers["User-Agent"] = ACADEMIC_UA
 
-    # ── public ────────────────────────────────────────────────────────────────
-
     def discover(self, university: dict) -> list[dict]:
-        """
-        Return up to max_seeds scored seed candidates for one university:
-          {institution, seed_url, source, score, matched_terms, reason}
-        Sorted by score (desc). Empty list ⇒ caller falls back to homepage crawl.
-        """
         name = university.get("name", "?")
         base = (university.get("base_url")
                 or (university.get("catalog_urls") or [""])[0])
@@ -162,7 +119,6 @@ class SeedDiscoverer:
         root = f"{parsed.scheme}://{parsed.netloc}"
         allowed = registered_domain(parsed.netloc)
 
-        # candidate url -> {source, anchor, in_sitemap} (first source wins)
         cands: dict[str, dict] = {}
 
         def add(url, source, anchor=""):
@@ -170,7 +126,7 @@ class SeedDiscoverer:
             if not url or not same_registered_domain(url, allowed):
                 return
             if url.rstrip("/") == root.rstrip("/"):
-                return  # the homepage itself is not a *discovered* seed
+                return
             cur = cands.get(url)
             if cur is None:
                 if len(cands) >= MAX_CANDIDATES:
@@ -182,7 +138,6 @@ class SeedDiscoverer:
                     cur["anchor"] = anchor
                 cur["in_sitemap"] = cur["in_sitemap"] or source == "sitemap"
 
-        # 1) homepage internal links (with anchor text)
         n_home = 0
         html = self._fetch_text(base)
         if html:
@@ -190,17 +145,18 @@ class SeedDiscoverer:
                 add(href, "homepage", anchor)
             n_home = len(cands)
 
-        # 2) robots.txt → declared sitemaps
         sitemap_urls = [root + "/sitemap.xml"]
         robots_txt = self._fetch_text(root + "/robots.txt", check_robots=False)
         for sm in parse_robots_sitemaps(robots_txt or ""):
             if sm not in sitemap_urls:
                 sitemap_urls.append(sm)
 
-        # 3) sitemaps (+ 1 level of index recursion, all capped)
         n_sitemap_urls = 0
         fetched = 0
         queue = list(sitemap_urls)
+        # CAMBIO (bug): no había ningún control de sitemaps YA vistos en esta
+        # cola de recursión. 
+        seen_sitemaps: set[str] = set(sitemap_urls)
         while queue and fetched < MAX_SITEMAP_FETCHES:
             sm_url = queue.pop(0)
             body = self._fetch_text(sm_url, check_robots=False)
@@ -212,10 +168,12 @@ class SeedDiscoverer:
             for u in urls:
                 add(u, "sitemap")
             for child in children[:MAX_CHILD_SITEMAPS]:
+                if child in seen_sitemaps:
+                    continue
                 if same_registered_domain(child, allowed):
+                    seen_sitemaps.add(child)
                     queue.append(child)
 
-        # score & rank
         scored: list[dict] = []
         for url, info in cands.items():
             score, matched, reason = score_candidate(
@@ -242,10 +200,7 @@ class SeedDiscoverer:
             logger.info(f"    [{s['score']:>3}] {s['seed_url']}  ({s['reason']})")
         return kept
 
-    # ── internals ─────────────────────────────────────────────────────────────
-
     def _fetch_text(self, url: str, check_robots: bool = True) -> str:
-        """GET a text document (fail-soft, size-capped, gunzips .gz sitemaps)."""
         if check_robots and not self.robots.allowed(url):
             logger.info(f"  robots.txt disallows: {url}")
             return ""
@@ -262,7 +217,7 @@ class SeedDiscoverer:
                 if len(content) > MAX_FETCH_BYTES:
                     break
             resp.close()
-            if content[:2] == b"\x1f\x8b":  # gzipped sitemap
+            if content[:2] == b"\x1f\x8b":
                 try:
                     content = gzip.decompress(content)
                 except Exception:
@@ -274,8 +229,6 @@ class SeedDiscoverer:
 
     @staticmethod
     def _extract_anchors(html: str) -> list[tuple[str, str]]:
-        """(raw_href, anchor_text) for every followable <a> on a page.
-        Hrefs are resolved/normalized by the caller (add → normalize_url)."""
         try:
             from bs4 import BeautifulSoup
         except ImportError:
