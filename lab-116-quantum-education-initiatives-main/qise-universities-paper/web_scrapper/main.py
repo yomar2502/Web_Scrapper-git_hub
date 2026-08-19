@@ -1,100 +1,310 @@
 """
-main.py — CLI entry point for the QISE-LatAm scraper.
+main.py — Command-line entry point for the QISE-LatAm scraper.
 
 Typical use:
     python main.py --input data/universities.csv --output data/qise_candidates.csv
 
 Useful flags:
-    --max-depth 2                 crawl depth per institution
-    --max-pages-per-domain 100    hard cap on pages fetched per institution
-    --download-pdfs true|false    fetch & parse linked PDFs (default: true)
-    --country Peru                only process institutions from this country
-    --resume true|false           skip institutions already in the output file
-    --limit 200                   stop after N fragments (quick smoke test)
-    --dry-run                     classify but do not write output files
-    --no-cache                    ignore the on-disk download cache
-    --no-robots                   do not consult robots.txt (use responsibly)
+    --max-depth 2                  crawl depth per institution
+    --max-pages-per-domain 100     hard page cap per institution
+    --request-delay 1.5            seconds between requests
+    --download-pdfs true|false     fetch and parse linked PDFs
+    --country Peru                 filter by country name or ISO code
+    --resume true|false            skip institutions already in the output
+    --limit 200                    stop after N processed fragments
+    --dry-run                      run without writing result files
+    --fail-on-empty                return exit code 1 when no evidence is found
+    --no-cache                     ignore the on-disk download cache
+    --no-robots                    skip robots.txt checks (use responsibly)
 
-Input may be CSV or YAML. If --input is omitted the loader falls back to
---sources (default sources.yaml).
+Input may be CSV or YAML. If --input is omitted, the loader uses --sources
+(default: sources.yaml).
+
+Exit codes:
+    0    completed successfully (an empty result is valid by default)
+    1    completed but found no rows/seeds and --fail-on-empty was requested
+    2    invalid input, configuration, or command-line arguments
+    3    unexpected execution failure
+    130  interrupted by the user
 """
 
-import argparse
-import sys
+from __future__ import annotations
 
-from pipeline import Pipeline
+import argparse
+import math
+from collections.abc import Sequence
+from pathlib import Path
+
+from pipeline import Pipeline, SummaryStats
 from utils import get_logger
 
 logger = get_logger("main")
 
+_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+_FALSE_VALUES = {"0", "false", "no", "n", "off"}
+_INPUT_SUFFIXES = {".csv", ".yaml", ".yml"}
 
-def _str2bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _str2bool(value: str | bool) -> bool:
+    """Parse an explicit command-line boolean without silent fallbacks."""
+    if isinstance(value, bool):
+        return value
+
+    normalized = str(value).strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+
+    choices = "true/false, yes/no, 1/0, on/off"
+    raise argparse.ArgumentTypeError(
+        f"invalid boolean value {value!r}; use one of: {choices}"
+    )
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="QISE-LatAm scraper: harvest auditable quantum-coursework "
-                    "evidence from Latin American universities.",
+def _non_negative_int(value: str) -> int:
+    """Argparse type for integers greater than or equal to zero."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    """Argparse type for integers greater than zero."""
+    parsed = _non_negative_int(value)
+    if parsed == 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    """Argparse type for finite floats greater than or equal to zero."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected a number") from exc
+    if parsed < 0 or not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be a finite number >= 0")
+    return parsed
+
+
+def _validate_file(
+    parser: argparse.ArgumentParser,
+    value: str,
+    option: str,
+    allowed_suffixes: set[str],
+) -> None:
+    """Validate a required local input file and its extension."""
+    path = Path(value)
+    if not path.is_file():
+        parser.error(f"{option} does not exist or is not a file: {value}")
+    if path.suffix.lower() not in allowed_suffixes:
+        expected = ", ".join(sorted(allowed_suffixes))
+        parser.error(f"{option} must use one of these extensions: {expected}")
+
+
+def _validate_args(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    """Validate paths and combinations that argparse cannot express alone."""
+    _validate_file(parser, args.config, "--config", {".yaml", ".yml"})
+
+    if args.input:
+        _validate_file(parser, args.input, "--input", _INPUT_SUFFIXES)
+    else:
+        _validate_file(parser, args.sources, "--sources", _INPUT_SUFFIXES)
+
+    if (args.include_news or args.include_social) and not Path(args.sources).is_file():
+        parser.error("--include-news/--include-social require a valid --sources file")
+
+    output = Path(args.output)
+    if output.suffix.lower() != ".csv":
+        parser.error("--output must be a .csv file")
+    if output.exists() and output.is_dir():
+        parser.error(f"--output points to a directory: {args.output}")
+    if output.parent.exists() and not output.parent.is_dir():
+        parser.error(f"--output parent is not a directory: {output.parent}")
+
+    if args.country is not None:
+        args.country = args.country.strip()
+        if not args.country:
+            parser.error("--country cannot be empty")
+
+    if args.discover_seeds_only:
+        ignored = []
+        if args.resume:
+            ignored.append("--resume")
+        if args.limit is not None:
+            ignored.append("--limit")
+        if args.include_news:
+            ignored.append("--include-news")
+        if args.include_social:
+            ignored.append("--include-social")
+        if ignored:
+            parser.error(
+                "--discover-seeds-only cannot be combined with " + ", ".join(ignored)
+            )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser separately so tests and integrations can reuse it."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "QISE-LatAm scraper: harvest auditable quantum-coursework "
+            "evidence from Latin American universities."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    p.add_argument("--input", default=None,
-                   help="University list (CSV or YAML). Falls back to --sources.")
-    p.add_argument("--output", default="data/qise_candidates.csv",
-                   help="Output CSV path (a .json sibling is also written).")
-    p.add_argument("--config", default="config.yaml", help="Config YAML path.")
-    p.add_argument("--sources", default="sources.yaml",
-                   help="Fallback source list if --input is not given.")
-    p.add_argument("--max-depth", type=int, default=None)
-    p.add_argument("--max-pages-per-domain", type=int, default=None)
-    p.add_argument("--download-pdfs", type=_str2bool, default=None,
-                   metavar="true|false")
-    p.add_argument("--country", default=None, help="Filter by country name or code.")
-    p.add_argument("--resume", type=_str2bool, default=False, metavar="true|false")
-    p.add_argument("--limit", type=int, default=None,
-                   help="Stop after N fragments (smoke test).")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Run without writing output files.")
-    p.add_argument("--no-cache", action="store_true",
-                   help="Ignore the on-disk download cache.")
-    p.add_argument("--no-robots", action="store_true",
-                   help="Skip robots.txt checks (use responsibly).")
-    p.add_argument("--include-news", action="store_true",
-                   help="Also crawl news_sources from the YAML sources file.")
-    p.add_argument("--include-social", action="store_true",
-                   help="Also query social_sources (needs API tokens).")
-    p.add_argument("--discover-seeds-only", action="store_true",
-                   help="Run automatic seed discovery, print/write the "
-                        "discovered seeds, and exit without crawling.")
-    p.add_argument("--auto-discover", type=_str2bool, default=None,
-                   metavar="true|false",
-                   help="Enable/disable automatic seed discovery for "
-                        "institutions without seed URLs (default: config).")
-    p.add_argument("--force-discover", action="store_true",
-                   help="Run seed discovery even for institutions that have "
-                        "manual seed URLs (discovered seeds replace them — "
-                        "for evaluating discovery quality).")
-    return p.parse_args()
+    parser.add_argument(
+        "--input",
+        default=None,
+        help="University list (.csv/.yaml/.yml). Falls back to --sources.",
+    )
+    parser.add_argument(
+        "--output",
+        default="data/qise_candidates.csv",
+        help="Output .csv path; a .json sibling is also written.",
+    )
+    parser.add_argument("--config", default="config.yaml", help="Config YAML path.")
+    parser.add_argument(
+        "--sources",
+        default="sources.yaml",
+        help="Fallback university/source list when --input is omitted.",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=_non_negative_int,
+        default=None,
+        help="Maximum link depth per institution (0 means seed pages only).",
+    )
+    parser.add_argument(
+        "--max-pages-per-domain",
+        type=_positive_int,
+        default=None,
+        help="Maximum pages fetched per institution.",
+    )
+    parser.add_argument(
+        "--request-delay",
+        type=_non_negative_float,
+        default=None,
+        metavar="SECONDS",
+        help="Minimum delay between requests; overrides config.yaml.",
+    )
+    parser.add_argument(
+        "--download-pdfs",
+        type=_str2bool,
+        default=None,
+        metavar="true|false",
+    )
+    parser.add_argument("--country", default=None, help="Country name or ISO code.")
+    parser.add_argument(
+        "--resume",
+        type=_str2bool,
+        default=False,
+        metavar="true|false",
+    )
+    parser.add_argument(
+        "--limit",
+        type=_positive_int,
+        default=None,
+        help="Stop after N processed fragments (smoke test).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run without writing candidate, seed, or summary files.",
+    )
+    parser.add_argument(
+        "--fail-on-empty",
+        action="store_true",
+        help="Return exit code 1 when no candidates or seeds are found.",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore the on-disk download cache.",
+    )
+    parser.add_argument(
+        "--no-robots",
+        action="store_true",
+        help="Skip robots.txt checks (use responsibly).",
+    )
+    parser.add_argument(
+        "--include-news",
+        action="store_true",
+        help="Also crawl news_sources from the sources file.",
+    )
+    parser.add_argument(
+        "--include-social",
+        action="store_true",
+        help="Also query social_sources; API tokens may be required.",
+    )
+    parser.add_argument(
+        "--discover-seeds-only",
+        action="store_true",
+        help="Discover seeds and exit without crawling.",
+    )
+    parser.add_argument(
+        "--auto-discover",
+        type=_str2bool,
+        default=None,
+        metavar="true|false",
+        help="Toggle automatic discovery for institutions without manual seeds.",
+    )
+    parser.add_argument(
+        "--force-discover",
+        action="store_true",
+        help="Discover even when manual seeds exist; discovered seeds replace them.",
+    )
+    return parser
 
 
-def main():
-    args = parse_args()
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse and validate command-line arguments."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    _validate_args(parser, args)
+    return args
+
+
+def _log_run(args: argparse.Namespace) -> None:
+    """Log the effective high-level execution parameters."""
+    logger.info("Input   : %s", args.input or args.sources)
+    logger.info("Output  : %s", args.output)
+    logger.info("Country : %s", args.country or "all")
+    logger.info(
+        "Resume  : %s | dry-run: %s | limit: %s",
+        args.resume,
+        args.dry_run,
+        args.limit if args.limit is not None else "none",
+    )
+
+
+def _empty_result_exit_code(empty: bool, fail_on_empty: bool) -> int:
+    """Treat an empty scientific result as success unless strict mode is set."""
+    return 1 if empty and fail_on_empty else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CLI and return a process exit code."""
+    args = parse_args(argv)
+    _log_run(args)
 
     overrides = {
         "max_depth": args.max_depth,
         "max_pages_per_university": args.max_pages_per_domain,
+        "request_delay_sec": args.request_delay,
         "download_pdfs": args.download_pdfs,
         "use_cache": False if args.no_cache else None,
         "respect_robots": False if args.no_robots else None,
         "auto_discover_seeds": args.auto_discover,
     }
-
-    logger.info(f"Input   : {args.input or args.sources}")
-    logger.info(f"Output  : {args.output}")
-    logger.info(f"Country : {args.country or 'all'}")
-    logger.info(f"Resume  : {args.resume} | dry-run: {args.dry_run} | "
-                f"limit: {args.limit or 'none'}")
 
     try:
         pipeline = Pipeline(
@@ -105,11 +315,16 @@ def main():
         )
 
         if args.discover_seeds_only:
-            n = pipeline.discover_only(country=args.country,
-                                       force=args.force_discover)
-            sys.exit(0 if n else 1)
+            seeds = pipeline.discover_only(
+                country=args.country,
+                force=args.force_discover,
+                dry_run=args.dry_run,
+            )
+            if seeds == 0:
+                logger.warning("Seed discovery completed without new seeds.")
+            return _empty_result_exit_code(seeds == 0, args.fail_on_empty)
 
-        summary = pipeline.run(
+        summary: SummaryStats = pipeline.run(
             output_path=args.output,
             dry_run=args.dry_run,
             limit=args.limit,
@@ -120,22 +335,26 @@ def main():
             force_discover=args.force_discover,
         )
 
-        if summary["candidate_rows"] == 0:
-            logger.warning("No candidate evidence found. Check that seed URLs are "
-                           "reachable and that --max-depth/--max-pages allow crawling.")
-            sys.exit(1)
-        sys.exit(0)
+        if summary.candidate_rows == 0:
+            logger.warning(
+                "No candidate evidence found. Check reachability, crawl budgets, "
+                "and the run summary before interpreting this as a confirmed zero."
+            )
+        return _empty_result_exit_code(
+            summary.candidate_rows == 0,
+            args.fail_on_empty,
+        )
 
-    except FileNotFoundError as e:
-        logger.error(str(e))
-        sys.exit(2)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("Invalid input or configuration: %s", exc)
+        return 2
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
-        sys.exit(0)
-    except Exception as e:
-        logger.exception(f"Unexpected error: {e}")
-        sys.exit(3)
+        return 130
+    except Exception:  # final CLI boundary: record the full traceback
+        logger.exception("Unexpected execution failure")
+        return 3
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
