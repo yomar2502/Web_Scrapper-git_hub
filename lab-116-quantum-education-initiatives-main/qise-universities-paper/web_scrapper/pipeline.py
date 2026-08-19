@@ -16,9 +16,9 @@ Flow:
                              │
                              ▼
               qise_candidates.csv  +  .json  +  run_summary.json
-
-Every output row carries a source URL and an evidence snippet, so the dataset is
-auditable: no "University X has QISE" claim without traceable evidence.
+                             │
+                             ▼
+              analytical_dataset.json  +  university_summary.csv  ← NUEVO
 """
 
 import csv
@@ -41,7 +41,6 @@ logger = get_logger("pipeline")
 
 # ── CONSTANTS ──────────────────────────────────────────────────────────────────
 
-# Auditable output schema (column order)
 OUTPUT_FIELDS = [
     "timestamp",
     "institution",
@@ -68,7 +67,6 @@ OUTPUT_FIELDS = [
     "language",
 ]
 
-# Task-brief config key spellings accepted as aliases of the internal names
 _CONFIG_KEY_ALIASES = {
     "max_pages_per_domain": "max_pages_per_university",
     "request_delay_seconds": "request_delay_sec",
@@ -76,10 +74,8 @@ _CONFIG_KEY_ALIASES = {
     "respect_robots_txt": "respect_robots",
 }
 
-# Confidence ranking for deduplication
 _CONF_RANK = {"high": 3, "medium": 2, "low": 1, "": 0, None: 0}
 
-# Classification order for sorting
 _CLASS_ORDER = {
     "qise_core": 0,
     "quantum_foundations_or_adjacent": 1,
@@ -87,9 +83,6 @@ _CLASS_ORDER = {
     "non_course_or_contextual": 3,
 }
 
-# Leading course-code token ("MF719 ", "FIS-410: ", "EE 80 ") — stripped from
-# the dedupe key so a catalog listing "Simetrías discretas" and its syllabus
-# page "MF719 Simetrías discretas" collapse into one row.
 _COURSE_CODE_PREFIX = re.compile(r"^[a-z]{1,4}[- ]?\d{2,4}[a-z]?\b[\s.:–—-]*")
 
 
@@ -308,7 +301,30 @@ class Pipeline:
 
         logger.info("Phase 2/2 — writing output...")
         if not dry_run:
-            self._write_output(Path(output_path), all_rows)
+            output_path_obj = Path(output_path)
+            
+            # ── 1. CSV principal ──────────────────────────────────────────────
+            self._write_csv(output_path_obj, all_rows)
+            
+            # ── 2. JSON principal ─────────────────────────────────────────────
+            self._write_json(output_path_obj.with_suffix(".json"), all_rows)
+            
+            # ── 3. NUEVO: Dataset analítico ──────────────────────────────────
+            analytical = self._build_analytical_dataset(all_rows)
+            analytical_path = output_path_obj.with_suffix(".analytical.json")
+            analytical_path.write_text(
+                json.dumps(analytical, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            logger.info(f"Analytical dataset saved → {analytical_path}")
+            
+            # ── 4. NUEVO: Resumen por universidad ────────────────────────────
+            uni_summary_path = output_path_obj.parent / "university_summary.csv"
+            self._write_university_summary(uni_summary_path, analytical["summary_by_university"])
+            
+            # ── 5. NUEVO: Resumen por país ────────────────────────────────────
+            country_summary_path = output_path_obj.parent / "country_summary.csv"
+            self._write_country_summary(country_summary_path, analytical["summary_by_country"])
 
         elapsed = round(time.time() - start, 1)
         summary = self._build_summary(
@@ -326,6 +342,153 @@ class Pipeline:
             self._save_summary(summary)
 
         return summary
+
+    # ── NUEVO: DATASET ANALÍTICO ─────────────────────────────────────────────
+
+    def _build_analytical_dataset(self, rows: List[Dict]) -> Dict[str, Any]:
+        """
+        Build the final analytical dataset for the paper.
+        
+        Returns:
+            Dict with:
+                - summary_by_university: {university: {qise_core, adjacent, unclear, non_course, total, country, country_code}}
+                - summary_by_country: {country_code: {qise_core, adjacent, unclear, non_course, total, universities}}
+                - unique_qise_courses: List of unique course titles with QISE
+                - qise_core_count: Total QISE courses
+                - classification_stats: {classification: count}
+                - confidence_stats: {confidence: count}
+                - total_rows: Total rows
+                - universities_with_qise: Number of universities with QISE
+                - countries_with_qise: Number of countries with QISE
+        """
+        
+        # ── 1. Resumen por universidad ──────────────────────────────────────
+        by_university: Dict[str, Dict] = {}
+        for r in rows:
+            name = r.get("institution", "unknown")
+            if name not in by_university:
+                by_university[name] = {
+                    "qise_core": 0,
+                    "adjacent": 0,
+                    "unclear": 0,
+                    "non_course": 0,
+                    "total": 0,
+                    "country": r.get("country", ""),
+                    "country_code": r.get("country_code", ""),
+                }
+            cls = r.get("classification", "unclear")
+            if cls == "qise_core":
+                by_university[name]["qise_core"] += 1
+            elif cls == "quantum_foundations_or_adjacent":
+                by_university[name]["adjacent"] += 1
+            elif cls == "unclear":
+                by_university[name]["unclear"] += 1
+            else:
+                by_university[name]["non_course"] += 1
+            by_university[name]["total"] += 1
+
+        # ── 2. Resumen por país ─────────────────────────────────────────────
+        by_country: Dict[str, Dict] = {}
+        for uni, stats in by_university.items():
+            code = stats.get("country_code", "??")
+            if code not in by_country:
+                by_country[code] = {
+                    "qise_core": 0,
+                    "adjacent": 0,
+                    "unclear": 0,
+                    "non_course": 0,
+                    "total": 0,
+                    "universities": [],
+                    "country": stats.get("country", ""),
+                }
+            by_country[code]["qise_core"] += stats["qise_core"]
+            by_country[code]["adjacent"] += stats["adjacent"]
+            by_country[code]["unclear"] += stats["unclear"]
+            by_country[code]["non_course"] += stats["non_course"]
+            by_country[code]["total"] += stats["total"]
+            by_country[code]["universities"].append(uni)
+
+        # ── 3. Cursos únicos QISE ───────────────────────────────────────────
+        unique_qise = {}
+        for r in rows:
+            if r.get("classification") == "qise_core":
+                title = r.get("course_title", "")
+                if title and title not in unique_qise:
+                    unique_qise[title] = {
+                        "course": title,
+                        "institution": r.get("institution", ""),
+                        "country": r.get("country", ""),
+                        "semantic_category": r.get("semantic_category", ""),
+                        "source_url": r.get("source_url", ""),
+                    }
+
+        # ── 4. Estadísticas de clasificación ────────────────────────────────
+        classification_stats = {}
+        confidence_stats = {}
+        for r in rows:
+            cls = r.get("classification", "unclear")
+            classification_stats[cls] = classification_stats.get(cls, 0) + 1
+            
+            conf = r.get("confidence", "low")
+            confidence_stats[conf] = confidence_stats.get(conf, 0) + 1
+
+        return {
+            "summary_by_university": by_university,
+            "summary_by_country": by_country,
+            "unique_qise_courses": list(unique_qise.values()),
+            "qise_core_count": len(unique_qise),
+            "classification_stats": classification_stats,
+            "confidence_stats": confidence_stats,
+            "total_rows": len(rows),
+            "universities_with_qise": len([u for u, s in by_university.items() if s["qise_core"] > 0]),
+            "countries_with_qise": len([c for c, s in by_country.items() if s["qise_core"] > 0]),
+        }
+
+    # ── NUEVO: GUARDAR RESUMEN POR UNIVERSIDAD ──────────────────────────────
+
+    def _write_university_summary(self, path: Path, summary: Dict[str, Dict]) -> None:
+        """Write university summary to CSV."""
+        fieldnames = ["university", "country", "country_code", "qise_core", "adjacent", "unclear", "non_course", "total"]
+        
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for name, stats in sorted(summary.items(), key=lambda x: -x[1]["qise_core"]):
+                w.writerow({
+                    "university": name,
+                    "country": stats.get("country", ""),
+                    "country_code": stats.get("country_code", ""),
+                    "qise_core": stats["qise_core"],
+                    "adjacent": stats["adjacent"],
+                    "unclear": stats["unclear"],
+                    "non_course": stats["non_course"],
+                    "total": stats["total"],
+                })
+        logger.info(f"University summary written → {path}")
+
+    # ── NUEVO: GUARDAR RESUMEN POR PAÍS ─────────────────────────────────────
+
+    def _write_country_summary(self, path: Path, summary: Dict[str, Dict]) -> None:
+        """Write country summary to CSV."""
+        fieldnames = ["country_code", "country", "qise_core", "adjacent", "unclear", "non_course", "total", "universities"]
+        
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for code, stats in sorted(summary.items(), key=lambda x: -x[1]["qise_core"]):
+                w.writerow({
+                    "country_code": code,
+                    "country": stats.get("country", ""),
+                    "qise_core": stats["qise_core"],
+                    "adjacent": stats["adjacent"],
+                    "unclear": stats["unclear"],
+                    "non_course": stats["non_course"],
+                    "total": stats["total"],
+                    "universities": " | ".join(sorted(stats["universities"])),
+                })
+        logger.info(f"Country summary written → {path}")
 
     # ── STAGE 1: SEED RESOLUTION ────────────────────────────────────────────
 
@@ -538,7 +701,7 @@ class Pipeline:
             "media_type": cand.get("media_type", ""),
             "source_url": cand.get("source_url", ""),
             "pdf_url": cand.get("pdf_url", ""),
-            "pdf_page": pdf_page if pdf_page is not None else "",  # ← CORREGIDO
+            "pdf_page": pdf_page if pdf_page is not None else "",
             "found_on_page": cand.get("found_on_page", ""),
             "seed_origin": cand.get("seed_origin", ""),
             "extraction_status": cand.get("extraction_status", "extracted"),
@@ -575,22 +738,7 @@ class Pipeline:
 
     # ── OUTPUT ───────────────────────────────────────────────────────────────
 
-    def _write_output(self, path: Path, rows: List[Dict]) -> None:
-        """Write output CSV and JSON files."""
-        sorted_rows = sorted(
-            rows,
-            key=lambda r: (
-                r.get("institution", ""),
-                _CLASS_ORDER.get(r.get("classification"), 9),
-                -_get_confidence_rank(r.get("confidence", "")),
-            )
-        )
-        
-        self._write_csv(path, sorted_rows)
-        self._write_json(path.with_suffix(".json"), sorted_rows)
-
-    @staticmethod
-    def _write_csv(path: Path, rows: List[Dict]) -> None:
+    def _write_csv(self, path: Path, rows: List[Dict]) -> None:
         """Write CSV output."""
         path.parent.mkdir(parents=True, exist_ok=True)
         

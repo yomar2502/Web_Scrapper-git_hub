@@ -389,6 +389,7 @@ class Dispatcher:
             return []
 
         try:
+            # ── HTML ──────────────────────────────────────────────────────────
             if raw_type == CONTENT_TYPE_HTML:
                 return extract_from_html(
                     content,
@@ -397,6 +398,7 @@ class Dispatcher:
                     found_on_page=found_on,
                 )
 
+            # ── PDF ───────────────────────────────────────────────────────────
             if raw_type == CONTENT_TYPE_PDF:
                 pdf_bytes = self._ensure_bytes(content)
                 return extract_from_pdf(
@@ -406,6 +408,7 @@ class Dispatcher:
                     found_on_page=found_on,
                 )
 
+            # ── SPREADSHEET ──────────────────────────────────────────────────
             if raw_type in {CONTENT_TYPE_XLSX, CONTENT_TYPE_XLS}:
                 excel_bytes = self._ensure_bytes(content)
                 return extract_from_xlsx(
@@ -415,6 +418,28 @@ class Dispatcher:
                     found_on_page=found_on,
                 )
 
+            # ── RSS ──────────────────────────────────────────────────────────
+            if raw_type == CONTENT_TYPE_RSS:
+                record = extract_from_rss_entry(content, source_name)
+                if record and record.get("raw_text"):
+                    return [record]
+                return []
+
+            # ── TWEET ─────────────────────────────────────────────────────────
+            if raw_type == CONTENT_TYPE_TWEET:
+                record = extract_from_tweet(content, raw.get("search_query", ""))
+                if record and record.get("raw_text"):
+                    return [record]
+                return []
+
+            # ── REDDIT ────────────────────────────────────────────────────────
+            if raw_type == CONTENT_TYPE_REDDIT_POST:
+                record = extract_from_reddit_post(content, raw.get("subreddit", ""))
+                if record and record.get("raw_text"):
+                    return [record]
+                return []
+
+            # ── UNKNOWN ──────────────────────────────────────────────────────
             logger.warning(
                 f"Unknown raw type '{raw_type}' from source '{source_name}', URL: {url}"
             )
