@@ -28,7 +28,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 from dataclasses import dataclass, field
-from datetime import datetime
 
 import yaml
 
@@ -48,24 +47,24 @@ OUTPUT_FIELDS = [
     "institution",
     "country",
     "country_code",
-    "classification",          # qise_core | quantum_foundations_or_adjacent | non_course_or_contextual | unclear
-    "confidence",              # high | medium | low
-    "is_qise_core",            # bool, convenience for the availability variable
-    "academic_level",          # undergraduate | graduate | unknown
-    "semantic_category",       # e.g. quantum_computing, quantum_mechanics
-    "keyword_tier",            # core | adjacent | generic
-    "matched_keyword",         # primary matched term
-    "matched_keywords",        # all matched terms (| separated)
+    "classification",
+    "confidence",
+    "is_qise_core",
+    "academic_level",
+    "semantic_category",
+    "keyword_tier",
+    "matched_keyword",
+    "matched_keywords",
     "course_title",
     "evidence_snippet",
-    "source_type",             # syllabus | curriculum_grid | catalog | department_page | course_list | html_page | pdf | news | social
-    "media_type",              # html | pdf
+    "source_type",
+    "media_type",
     "source_url",
     "pdf_url",
     "pdf_page",
-    "found_on_page",           # page a PDF link was discovered on
-    "seed_origin",             # manual | auto_discovered | homepage_crawl
-    "extraction_status",       # extracted | failed_pdf_extraction | needs_manual_review
+    "found_on_page",
+    "seed_origin",
+    "extraction_status",
     "language",
 ]
 
@@ -105,7 +104,6 @@ class PipelineConfig:
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PipelineConfig":
-        """Create PipelineConfig from dictionary."""
         return cls(
             scraper=data.get("scraper", {}),
             output=data.get("output", {}),
@@ -137,7 +135,6 @@ class SummaryStats:
     crawl_stats_per_institution: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "run_timestamp": self.run_timestamp,
             "elapsed_seconds": self.elapsed_seconds,
@@ -164,11 +161,7 @@ class SummaryStats:
 # ── HELPER FUNCTIONS ──────────────────────────────────────────────────────────
 
 def _title_key(title: str) -> str:
-    """
-    Generate a deduplication key from a course title.
-    
-    Strips course code prefixes (e.g., "MF719 ") and normalizes whitespace.
-    """
+    """Generate a deduplication key from a course title."""
     t = _COURSE_CODE_PREFIX.sub("", fold(title or ""))
     return re.sub(r"\s+", " ", t).strip()
 
@@ -193,17 +186,7 @@ def _get_confidence_rank(confidence: str) -> int:
 # ── PIPELINE ──────────────────────────────────────────────────────────────────
 
 class Pipeline:
-    """
-    Main pipeline orchestrator for QISE-LatAm scraping.
-    
-    Coordinates:
-        1. Seed discovery
-        2. Web crawling
-        3. Content extraction
-        4. QISE classification
-        5. Deduplication
-        6. Output generation
-    """
+    """Main pipeline orchestrator for QISE-LatAm scraping."""
 
     def __init__(
         self,
@@ -212,28 +195,15 @@ class Pipeline:
         sources_path: Optional[str] = None,
         overrides: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Initialize the pipeline.
-        
-        Args:
-            config_path: Path to configuration file
-            input_path: Path to input CSV/YAML
-            sources_path: Path to sources YAML
-            overrides: Configuration overrides
-        """
+        """Initialize the pipeline."""
         logger.info("=" * 60)
         logger.info("QISE-LatAm-Scraper pipeline starting")
         logger.info("=" * 60)
 
-        # Load configuration
         self.cfg = self._load_config(config_path)
         self._apply_overrides(overrides or {})
         self._ensure_output_dirs()
-
-        # Load universities
         self.universities = self._load_universities(input_path, sources_path)
-        
-        # Initialize classifier
         self.classifier = QISEClassifier(self.cfg)
         self._sources_path = sources_path
 
@@ -242,11 +212,9 @@ class Pipeline:
         with open(config_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         
-        # Set defaults
         cfg.setdefault("scraper", {})
         cfg.setdefault("output", {})
         
-        # Apply key aliases
         sc = cfg["scraper"]
         for alias, canonical in _CONFIG_KEY_ALIASES.items():
             if alias in sc and canonical not in sc:
@@ -303,45 +271,26 @@ class Pipeline:
         include_social: bool = False,
         force_discover: bool = False,
     ) -> SummaryStats:
-        """
-        Run the complete pipeline.
-        
-        Args:
-            output_path: Path for output CSV
-            dry_run: If True, don't write output
-            limit: Maximum fragments to process
-            country: Filter by country
-            resume: Resume from existing output
-            include_news: Include news sources
-            include_social: Include social media sources
-            force_discover: Force seed discovery for all institutions
-            
-        Returns:
-            Summary statistics
-        """
+        """Run the complete pipeline."""
         start = time.time()
         ts = now_iso()
 
-        # Filter universities
         universities = _filter_by_country(self.universities, country)
         logger.info(
             f"Universities to process: {len(universities)}"
             + (f" (country={country})" if country else "")
         )
 
-        # Resume support
         existing_rows, universities = self._handle_resume(
             output_path, resume, universities
         )
 
-        # Stage 1: Seed discovery
         seeds_discovered = self._resolve_seeds(
             universities,
             dry_run=dry_run,
             force=force_discover
         )
 
-        # Stage 2: Crawl and classify
         sources = self._build_sources(universities, include_news, include_social)
         dispatcher = Dispatcher(self.cfg, sources)
         
@@ -349,7 +298,6 @@ class Pipeline:
             dispatcher, universities, limit, ts
         )
 
-        # Merge and deduplicate
         new_rows = list(best.values())
         all_rows = self._merge(existing_rows, new_rows)
         
@@ -358,12 +306,10 @@ class Pipeline:
             f"({len(all_rows)} total)"
         )
 
-        # Stage 3: Write output
         logger.info("Phase 2/2 — writing output...")
         if not dry_run:
             self._write_output(Path(output_path), all_rows)
 
-        # Build and return summary
         elapsed = round(time.time() - start, 1)
         summary = self._build_summary(
             all_rows,
@@ -389,20 +335,13 @@ class Pipeline:
         dry_run: bool = False,
         force: bool = False
     ) -> int:
-        """
-        Resolve seeds for each university.
-        
-        Returns:
-            Number of auto-discovered seeds
-        """
-        # Set seed origin
+        """Resolve seeds for each university."""
         for u in universities:
             u["seed_origin"] = (
                 "manual" if u.get("has_manual_seeds")
                 else "homepage_crawl"
             )
 
-        # Determine which institutions need discovery
         auto = self.cfg["scraper"].get("auto_discover_seeds", True)
         targets = [
             u for u in universities
@@ -414,7 +353,6 @@ class Pipeline:
                 logger.info("Seed discovery disabled — crawling from homepage")
             return 0
 
-        # Run discovery
         from seed_discovery import SeedDiscoverer
         
         discoverer = SeedDiscoverer(self.cfg)
@@ -428,7 +366,6 @@ class Pipeline:
                 seeds = [f["seed_url"] for f in found]
                 base = normalize_url(u.get("base_url") or "")
                 
-                # Combine discovered seeds with base URL
                 u["catalog_urls"] = seeds + (
                     [base] if base and base not in seeds else []
                 )
@@ -436,11 +373,9 @@ class Pipeline:
             elif not u.get("has_manual_seeds"):
                 u["seed_origin"] = "homepage_crawl"
 
-        # Write discovered seeds
         if not dry_run:
             self._write_discovered_seeds(all_candidates)
 
-        # Log seed origins
         origins = {}
         for u in universities:
             origin = u["seed_origin"]
@@ -476,12 +411,7 @@ class Pipeline:
         limit: Optional[int],
         timestamp: str,
     ) -> Tuple[Dict[Tuple, Dict], int, Dict[str, int]]:
-        """
-        Process fragments from the dispatcher.
-        
-        Returns:
-            Tuple of (best_rows, fragments_seen, pdf_stats)
-        """
+        """Process fragments from the dispatcher."""
         best: Dict[Tuple, Dict] = {}
         fragments_seen = 0
         pdf_docs_seen: Set[str] = set()
@@ -493,40 +423,33 @@ class Pipeline:
         for fragment in dispatcher.stream_all_records():
             fragments_seen += 1
             
-            # Track PDF stats
             if fragment.get("media_type") == "pdf":
                 url = fragment.get("source_url", "")
                 pdf_docs_seen.add(url)
                 if fragment.get("extraction_status") == "extracted":
                     pdf_docs_extracted.add(url)
                 
-                # Store country for PDFs
                 country = fragment.get("country") or fragment.get("university_country", "")
                 if country:
                     pdf_url_to_country[url] = country
 
-            # Apply limit
             if limit and fragments_seen > limit:
                 logger.info(f"Fragment limit reached ({limit}). Stopping.")
                 break
 
-            # Classify and deduplicate
             for cand in self.classifier.classify(fragment):
                 row = self._to_row(cand, timestamp)
                 
-                # Generate dedupe key
                 key = (
                     row["source_url"],
                     row["semantic_category"],
                     _title_key(row.get("course_title", ""))
                 )
                 
-                # Keep best confidence
                 prev = best.get(key)
                 if prev is None or _get_confidence_rank(row["confidence"]) > _get_confidence_rank(prev["confidence"]):
                     best[key] = row
 
-            # Progress logging
             if fragments_seen % 100 == 0:
                 logger.info(f"  {fragments_seen} fragments | {len(best)} candidate rows")
 
@@ -615,7 +538,7 @@ class Pipeline:
             "media_type": cand.get("media_type", ""),
             "source_url": cand.get("source_url", ""),
             "pdf_url": cand.get("pdf_url", ""),
-            "pdf_page": "" if pdf_page is None else str(pdf_page),
+            "pdf_page": pdf_page if pdf_page is not None else "",  # ← CORREGIDO
             "found_on_page": cand.get("found_on_page", ""),
             "seed_origin": cand.get("seed_origin", ""),
             "extraction_status": cand.get("extraction_status", "extracted"),
@@ -654,7 +577,6 @@ class Pipeline:
 
     def _write_output(self, path: Path, rows: List[Dict]) -> None:
         """Write output CSV and JSON files."""
-        # Sort for reviewer-friendly output
         sorted_rows = sorted(
             rows,
             key=lambda r: (
@@ -720,7 +642,6 @@ class Pipeline:
             conf = r.get("confidence", "unknown")
             by_conf[conf] = by_conf.get(conf, 0) + 1
 
-        # QISE core analysis
         qise_core = [r for r in rows if r.get("classification") == "qise_core"]
         institutions_with_core = sorted({
             r["institution"] for r in qise_core
@@ -731,7 +652,6 @@ class Pipeline:
             if r.get("country_code")
         })
 
-        # Country breakdown
         by_country: Dict[str, Dict] = {}
         for r in rows:
             code = r.get("country_code") or "??"
@@ -749,25 +669,21 @@ class Pipeline:
                 if r.get("institution"):
                     b["institutions_with_core"].add(r["institution"])
 
-        # Convert sets to lengths/lists
         for code, b in by_country.items():
             b["institutions"] = len(b["institutions"])
             b["institutions_with_core"] = sorted(b["institutions_with_core"])
 
-        # PDF statistics
         pdf_rows = sum(1 for r in rows if r.get("media_type") == "pdf")
         manual_review = sum(
             1 for r in rows
             if r.get("extraction_status") != "extracted"
         )
 
-        # Seed origin breakdown
         by_seed_origin: Dict[str, int] = {}
         for r in rows:
             origin = r.get("seed_origin") or ""
             by_seed_origin[origin] = by_seed_origin.get(origin, 0) + 1
 
-        # Crawl statistics
         crawl_stats = dispatcher.web_crawler.stats if hasattr(dispatcher, "web_crawler") else {}
         pages_crawled = sum(s.get("pages_crawled", 0) for s in crawl_stats.values())
         pdfs_detected = sum(s.get("pdfs_detected", 0) for s in crawl_stats.values())
@@ -825,12 +741,7 @@ class Pipeline:
     # ── DISCOVER-ONLY MODE ──────────────────────────────────────────────────
 
     def discover_only(self, country: Optional[str] = None, force: bool = False) -> int:
-        """
-        Run seed discovery only, without crawling.
-        
-        Returns:
-            Number of discovered seeds
-        """
+        """Run seed discovery only, without crawling."""
         from seed_discovery import SeedDiscoverer
         
         universities = _filter_by_country(self.universities, country)
@@ -870,17 +781,6 @@ def run_pipeline(
     output_path: str = "data/processed/qise_candidates.csv",
     **kwargs
 ) -> SummaryStats:
-    """
-    Convenience function to run the pipeline.
-    
-    Args:
-        config_path: Path to configuration file
-        input_path: Path to input CSV/YAML
-        output_path: Path for output CSV
-        **kwargs: Additional arguments for Pipeline.run()
-        
-    Returns:
-        Summary statistics
-    """
+    """Convenience function to run the pipeline."""
     pipeline = Pipeline(config_path, input_path)
     return pipeline.run(output_path, **kwargs)
