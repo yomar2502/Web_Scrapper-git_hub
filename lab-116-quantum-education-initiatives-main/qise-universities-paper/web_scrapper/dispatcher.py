@@ -1,13 +1,9 @@
-"""
-dispatcher.py — Routes each source configuration to the appropriate crawler
-and then passes the raw crawler output to the corresponding extractor.
-
-Returns a unified stream of extracted text records ready for classification.
-"""
+"""dispatcher.py — Routes each source configuration to the appropriate crawler."""
 
 import os
 from typing import Generator, List, Dict, Optional, Any
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from crawler import (
     WebCrawler,
@@ -110,53 +106,30 @@ class ExtractedRecord:
 # ── DISPATCHER ────────────────────────────────────────────────────────────────
 
 class Dispatcher:
-    """
-    Coordinate crawlers and extractors for all configured sources.
-    
-    Routes:
-        - Universities → WebCrawler → HTML/PDF/XLSX extractors
-        - News → RSSCrawler or WebCrawler → RSS/HTML extractors
-        - Social Media → TwitterCrawler/RedditCrawler → Tweet/Reddit extractors
-    """
+    """Coordinate crawlers and extractors for all configured sources."""
 
     def __init__(self, cfg: Dict[str, Any], sources: Dict[str, Any]):
-        """
-        Initialize the dispatcher with configuration and sources.
-        
-        Args:
-            cfg: Main configuration dictionary
-            sources: Sources configuration dictionary
-        """
+        """Initialize the dispatcher with configuration and sources."""
         self.cfg = cfg or {}
         self.sources = sources or {}
         
-        # Validate configuration
         self._validate_config()
 
-        # Initialize crawlers
         self.web_crawler = WebCrawler(self.cfg)
         self.rss_crawler = RSSCrawler(self.cfg)
 
-        # Twitter crawler (optional)
         twitter_token = os.getenv("TWITTER_BEARER_TOKEN")
         if not twitter_token:
-            logger.warning(
-                "TWITTER_BEARER_TOKEN is not set. "
-                "Twitter sources will be skipped."
-            )
+            logger.warning("TWITTER_BEARER_TOKEN is not set. Twitter sources will be skipped.")
         
         self.twitter_crawler = TwitterCrawler(
             self.cfg,
             bearer_token=twitter_token,
         )
 
-        # Reddit crawler (optional)
         praw_config = self._build_reddit_config()
         if praw_config is None:
-            logger.warning(
-                "REDDIT_CLIENT_ID is not set. "
-                "Reddit sources may be skipped."
-            )
+            logger.warning("REDDIT_CLIENT_ID is not set. Reddit sources may be skipped.")
 
         self.reddit_crawler = RedditCrawler(
             self.cfg,
@@ -179,21 +152,8 @@ class Dispatcher:
                 f"{news_count} news sources, {social_count} social sources"
             )
 
-    # ── MAIN STREAM METHOD ──────────────────────────────────────────────────
-
     def stream_all_records(self) -> Generator[Dict[str, Any], None, None]:
-        """
-        Yield extracted records from all configured source types.
-        
-        The order is:
-            1. Universities (highest priority)
-            2. News sources
-            3. Social media (lowest priority)
-        
-        Yields:
-            Dictionary with extracted text and metadata
-        """
-        # Count sources for logging
+        """Yield extracted records from all configured source types."""
         universities = self.sources.get("universities", [])
         news_sources = self.sources.get("news_sources", [])
         social_sources = self.sources.get("social_sources", [])
@@ -209,16 +169,9 @@ class Dispatcher:
         
         logger.info("Dispatch complete")
 
-    # ── CONFIGURATION HELPERS ──────────────────────────────────────────────
-
     @staticmethod
     def _build_reddit_config() -> Optional[Dict[str, str]]:
-        """
-        Build PRAW configuration from environment variables.
-        
-        Returns:
-            Reddit configuration dict or None if not configured
-        """
+        """Build PRAW configuration from environment variables."""
         client_id = os.getenv("REDDIT_CLIENT_ID")
         if not client_id:
             return None
@@ -231,8 +184,6 @@ class Dispatcher:
                 "QISE-LatAm-Research-Bot/1.0"
             ),
         }
-
-    # ── UNIVERSITY STREAM ──────────────────────────────────────────────────
 
     def _stream_universities(self) -> Generator[Dict[str, Any], None, None]:
         """Crawl and extract records from configured universities."""
@@ -248,7 +199,6 @@ class Dispatcher:
             name = university.get("name", "unknown")
             source_type = university.get("type", "")
             
-            # Validate source type
             if source_type != SOURCE_TYPE_WEB:
                 logger.warning(
                     f"Skipping university '{name}': "
@@ -257,7 +207,6 @@ class Dispatcher:
                 continue
 
             try:
-                # Crawl and extract
                 for raw in self.web_crawler.crawl_university(university):
                     for record in self._extract_raw(raw, university):
                         if self._is_valid_record(record):
@@ -267,8 +216,6 @@ class Dispatcher:
                 logger.exception(
                     f"Failed to crawl university '{name}': {e}"
                 )
-
-    # ── NEWS STREAM ─────────────────────────────────────────────────────────
 
     def _stream_news(self) -> Generator[Dict[str, Any], None, None]:
         """Crawl and extract records from configured news sources."""
@@ -315,7 +262,6 @@ class Dispatcher:
 
             record = extract_from_rss_entry(entry, source.name)
             if record and record.get("raw_text"):
-                # Add country info
                 record["country"] = source.country
                 record["country_code"] = source.country_code
                 yield record
@@ -340,8 +286,6 @@ class Dispatcher:
             for record in self._extract_raw(raw, dummy_source):
                 if self._is_valid_record(record):
                     yield record
-
-    # ── SOCIAL MEDIA STREAM ────────────────────────────────────────────────
 
     def _stream_social(self) -> Generator[Dict[str, Any], None, None]:
         """Crawl and extract records from social media sources."""
@@ -368,8 +312,7 @@ class Dispatcher:
                 elif source_type == SOURCE_TYPE_LINKEDIN:
                     logger.warning(
                         f"LinkedIn source '{source_name}' skipped. "
-                        "Automated scraping is not supported. "
-                        "Use the official LinkedIn API or manual collection."
+                        "Automated scraping is not supported."
                     )
 
                 else:
@@ -426,23 +369,12 @@ class Dispatcher:
             if record and record.get("raw_text"):
                 yield record
 
-    # ── EXTRACTION ROUTER ──────────────────────────────────────────────────
-
     def _extract_raw(
         self,
         raw: Dict[str, Any],
         source: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """
-        Route raw crawler output to the appropriate extractor.
-        
-        Args:
-            raw: Raw crawler output
-            source: Source configuration
-            
-        Returns:
-            List of extracted records
-        """
+        """Route raw crawler output to the appropriate extractor."""
         if not raw:
             return []
 
@@ -452,13 +384,11 @@ class Dispatcher:
         found_on = raw.get("found_on", "")
         source_name = source.get("name", "unknown")
 
-        # Validate content
         if not content:
             logger.debug(f"Empty content for '{url}' ({raw_type})")
             return []
 
         try:
-            # HTML content
             if raw_type == CONTENT_TYPE_HTML:
                 return extract_from_html(
                     content,
@@ -467,7 +397,6 @@ class Dispatcher:
                     found_on_page=found_on,
                 )
 
-            # PDF content
             if raw_type == CONTENT_TYPE_PDF:
                 pdf_bytes = self._ensure_bytes(content)
                 return extract_from_pdf(
@@ -477,7 +406,6 @@ class Dispatcher:
                     found_on_page=found_on,
                 )
 
-            # Spreadsheet content
             if raw_type in {CONTENT_TYPE_XLSX, CONTENT_TYPE_XLS}:
                 excel_bytes = self._ensure_bytes(content)
                 return extract_from_xlsx(
@@ -487,7 +415,6 @@ class Dispatcher:
                     found_on_page=found_on,
                 )
 
-            # Unknown type
             logger.warning(
                 f"Unknown raw type '{raw_type}' from source '{source_name}', URL: {url}"
             )
@@ -500,22 +427,9 @@ class Dispatcher:
             )
             return []
 
-    # ── UTILITY METHODS ─────────────────────────────────────────────────────
-
     @staticmethod
     def _ensure_bytes(content: Any) -> bytes:
-        """
-        Convert crawler content to bytes safely.
-        
-        Args:
-            content: Content in various formats
-            
-        Returns:
-            Content as bytes
-            
-        Raises:
-            TypeError: If content is not a supported type
-        """
+        """Convert crawler content to bytes safely."""
         if isinstance(content, bytes):
             return content
 
@@ -532,23 +446,13 @@ class Dispatcher:
 
     @staticmethod
     def _is_valid_record(record: Dict[str, Any]) -> bool:
-        """
-        Check if a record is valid and has content.
-        
-        Args:
-            record: Extracted record
-            
-        Returns:
-            True if the record is valid
-        """
+        """Check if a record is valid and has content."""
         if not record:
             return False
             
-        # Check for required fields
         if not record.get("raw_text"):
             return False
             
-        # Minimum content length (avoid empty or very short records)
         if len(record.get("raw_text", "").strip()) < 10:
             return False
             
@@ -562,26 +466,27 @@ def run_dispatcher(config_path: str) -> List[Dict[str, Any]]:
     Convenience function to run the dispatcher and collect all records.
     
     Args:
-        config_path: Path to configuration file
+        config_path: Path to configuration file (JSON or YAML)
         
     Returns:
         List of all extracted records
     """
     import json
-    from pathlib import Path
+    import yaml
     
-    # Load configuration
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
+    config_path = Path(config_path)
     
-    # Initialize dispatcher
+    # Soporte para YAML y JSON
+    if config_path.suffix.lower() in (".yaml", ".yml"):
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+    else:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    
     dispatcher = Dispatcher(config, config.get("sources", {}))
     
-    # Collect all records
-    records = []
-    for record in dispatcher.stream_all_records():
-        records.append(record)
-    
+    records = list(dispatcher.stream_all_records())
     logger.info(f"Collected {len(records)} total records")
     return records
 
