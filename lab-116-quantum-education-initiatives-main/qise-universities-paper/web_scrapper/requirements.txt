@@ -30,5 +30,5 @@ feedparser>=6.0.10
 # ── Optional: OCR for scanned PDFs (NOT enabled; future work) ─────────────────
 # Scanned/image PDFs are currently flagged `needs_manual_review`. To add OCR
 # later, install these and implement an isolated OCR fallback in extractor.py:
-# pytesseract>=0.3.10
-# pdf2image>=1.17.0
+pytesseract>=0.3.10
+pdf2image>=1.17.0
