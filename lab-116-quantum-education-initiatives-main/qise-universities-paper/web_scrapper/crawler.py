@@ -1,866 +1,725 @@
-"""Tests for crawler.py - 100% coverage."""
+"""
+crawler.py — Crawlers especializados por tipo de fuente.
+"""
 
-import pytest
-import tempfile
+import heapq
+import itertools
+import re
 import json
 from pathlib import Path
-from unittest.mock import Mock, patch, MagicMock, mock_open
+from urllib.parse import urlparse
+from typing import Generator, Optional, Dict, List, Tuple, Any
+from dataclasses import dataclass, field
 
 import requests
 
-from crawler import (
-    WebCrawler,
-    RSSCrawler,
-    TwitterCrawler,
-    RedditCrawler,
-    CrawlStats,
-    FetchResult,
-    _make_session,
-    ACADEMIC_UA,
-    logger,
+from keywords import (
+    ACADEMIC_SEED_TERMS, STEM_TERMS, LOW_PRIORITY_TERMS, match_terms,
+)
+from utils import (
+    RateLimiter, RobotsCache, get_logger, slugify,
+    normalize_url, same_registered_domain, registered_domain, url_hash,
+    looks_like_pdf_url, external_doc_download_url,
+)
+
+logger = get_logger("crawler")
+
+ACADEMIC_UA = (
+    "QISE-LatAm-Research-Bot/2.0 (academic research on quantum education; "
+    "+contact via project README)"
 )
 
 
-# ── TEST MAKE SESSION ─────────────────────────────────────────────────────
+# ── SESSION CONFIGURATION ──────────────────────────────────────────────────
 
-class TestMakeSession:
-    """Test _make_session function."""
+def _make_session(user_agent: str, timeout: int, max_retries: int) -> requests.Session:
+    """Create a configured requests session with retry logic."""
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
-    def test_make_session_default(self):
-        """Test creating session with default user agent."""
-        session = _make_session(None, 30, 3)
-        assert session.headers["User-Agent"] == ACADEMIC_UA
-        assert "Accept" in session.headers
-        assert "Accept-Language" in session.headers
-
-    def test_make_session_custom_ua(self):
-        """Test creating session with custom user agent."""
-        session = _make_session("custom-bot", 30, 3)
-        assert session.headers["User-Agent"] == "custom-bot"
-
-
-# ── TEST CRAWLSTATS ───────────────────────────────────────────────────────
-
-class TestCrawlStats:
-    """Test CrawlStats dataclass."""
-
-    def test_defaults(self):
-        """Test default values."""
-        stats = CrawlStats()
-        assert stats.pages_crawled == 0
-        assert stats.html_pages == 0
-        assert stats.pdfs_detected == 0
-
-    def test_custom_values(self):
-        """Test custom values."""
-        stats = CrawlStats(pages_crawled=10, html_pages=5, pdfs_detected=3)
-        assert stats.pages_crawled == 10
-        assert stats.html_pages == 5
-        assert stats.pdfs_detected == 3
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": user_agent or ACADEMIC_UA,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "application/pdf;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "es,pt,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection": "keep-alive",
+    })
+    
+    retry = Retry(
+        total=max_retries,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    return session
 
 
-# ── TEST FETCHRESULT ─────────────────────────────────────────────────────
+# ── WEB CRAWLER ────────────────────────────────────────────────────────────
 
-class TestFetchResult:
-    """Test FetchResult dataclass."""
+@dataclass
+class CrawlStats:
+    """Statistics for a crawl session."""
+    pages_crawled: int = 0
+    html_pages: int = 0
+    pdfs_detected: int = 0
 
-    def test_defaults(self):
-        """Test default values."""
-        result = FetchResult(
-            content=b"test",
-            text="test",
-            content_type="text/html",
-            final_url="https://test.com",
-            is_pdf=False,
-            is_html=True,
+
+@dataclass
+class FetchResult:
+    """Result of fetching a URL."""
+    content: bytes
+    text: str
+    content_type: str
+    final_url: str
+    is_pdf: bool
+    is_html: bool
+    doc_kind: str = ""
+
+
+class WebCrawler:
+    """Main web crawler for academic course pages."""
+
+    # Course URL patterns for identifying relevant pages
+    COURSE_URL_PATTERNS = re.compile(
+        r"(curso|course|syllabus|silabo|s[íi]labo"
+        r"|asignatura|disciplina|programa|materia|pensum|ementa"
+        r"|catalogo|catalog|oferta.?academ|curricul|malla|grade.?curricular"
+        r"|matriz.?curricular|plano.?de.?ensino"
+        r"|posgrado|postgrado|graduate|undergraduate|graduacao"
+        r"|licenciatura|maestr[íi]a|maestria|mestrado|doutorado|doctorado"
+        r"|especializacion|especializaci[oó]n|carrera"
+        r"|fisica|f[íi]sica|ingenieria|ingenier[íi]a|ciencias|computac"
+        r"|pregrado|plan.?de.?estudio)",
+        re.IGNORECASE,
+    )
+
+    # Patterns for anchor text that indicates course content
+    COURSE_ANCHOR_PATTERNS = re.compile(
+        r"(malla|plan de estudio|pensum|s[íi]labo|syllabus|programa|curr[íi]cul"
+        r"|grade curricular|matriz curricular|ementa|asignatura|disciplina|curso)",
+        re.IGNORECASE,
+    )
+
+    # High-priority curriculum patterns
+    CURRICULUM_PRIORITY_PATTERNS = re.compile(
+        r"(plan.?de.?estudio|malla|pensum|curricul|grade.?curricular"
+        r"|matriz.?curricular|plano.?de.?ensino|silabo|s[íi]labo|syllabus"
+        r"|(?<![a-z])ementa|oferta.?academ|catalogo|catalog)",
+        re.IGNORECASE,
+    )
+
+    # Junk to NEVER queue: binary assets, auth/admin, per-user pages
+    HARD_SKIP_PATTERNS = re.compile(
+        r"\.(jpg|jpeg|png|gif|svg|ico|mp4|mp3|zip|rar|exe|js|css"
+        r"|woff|woff2|ttf|eot)(\?.*)?$"
+        r"|/(login|logout|wp-admin|wp-login|search|tag|autor|author"
+        r"|comment|registro|register|password|reset|shop"
+        r"|contact|contacto|sitemap|privacidad|privacy|terminos|terms"
+        r"|rss|atom|newsletter|suscri)"
+        r"|/admin(?![a-z])"  # Fixed: only matches "admin" not "administracion"
+        r"|/cart(?![a-z])",  # Fixed: only matches "cart" not "cartelera"
+        re.IGNORECASE,
+    )
+
+    # Low-priority URL patterns (crawled but de-prioritized)
+    LOW_PRIORITY_URL_PATTERNS = re.compile(
+        r"/(noticias?|news|blog|boletin|eventos?|events?|agenda|calendario"
+        r"|prensa|press|comunicado|galeria|gallery"
+        r"|admision(es)?|admissions?|vestibular"
+        r"|alumni|egresados|exalumnos|deportes?|sports"
+        r"|profesor|docentes?|staff|equipo|team|investigador|researcher"
+        r"|transparencia|licitacion|administrativ)",
+        re.IGNORECASE,
+    )
+
+    def __init__(self, cfg: dict):
+        """Initialize the web crawler with configuration."""
+        sc = cfg["scraper"]
+        
+        # Crawl settings
+        self.delay = sc["request_delay_sec"]
+        self.timeout = sc["request_timeout_sec"]
+        self.max_retries = sc["max_retries"]
+        self.global_max_depth = sc["max_depth"]
+        self.global_max_pages = sc["max_pages_per_university"]
+        self.download_pdfs = sc.get("download_pdfs", True)
+        self.use_cache = sc.get("use_cache", True)
+        self.max_pdf_bytes = int(sc.get("max_pdf_mb", 40)) * 1024 * 1024
+        self.max_pdfs_per_domain = int(sc.get("max_pdfs_per_domain", 50))
+        self.fetch_external_docs = sc.get("fetch_external_docs", True)
+        self.user_agent = sc.get("user_agent") or ACADEMIC_UA
+        
+        # State
+        self.stats: Dict[str, CrawlStats] = {}
+        self._seen_hosts: set[str] = set()
+        self.raw_dir = Path(cfg["output"]["raw_dir"])
+        self.raw_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Network components
+        self.limiter = RateLimiter(min_delay=self.delay)
+        self.session = _make_session(self.user_agent, self.timeout, self.max_retries)
+        self.robots = RobotsCache(
+            self.user_agent, 
+            enabled=sc.get("respect_robots", True), 
+            logger=logger
         )
-        assert result.doc_kind == ""
 
-    def test_with_doc_kind(self):
-        """Test with doc_kind."""
-        result = FetchResult(
-            content=b"test",
-            text="test",
-            content_type="application/vnd.ms-excel",
-            final_url="https://test.com",
-            is_pdf=False,
-            is_html=False,
-            doc_kind="xls",
-        )
-        assert result.doc_kind == "xls"
-
-
-# ── TEST WEBCRAWLER ──────────────────────────────────────────────────────
-
-class TestWebCrawler:
-    """Test WebCrawler class."""
-
-    @pytest.fixture
-    def mock_config(self):
-        """Create mock configuration."""
-        return {
-            "scraper": {
-                "request_delay_sec": 0.1,
-                "request_timeout_sec": 10,
-                "max_retries": 2,
-                "max_depth": 2,
-                "max_pages_per_university": 10,
-                "download_pdfs": True,
-                "use_cache": True,
-                "respect_robots": True,
-                "max_pdf_mb": 40,
-                "max_pdfs_per_domain": 5,
-                "fetch_external_docs": True,
-                "user_agent": "test-bot",
-            },
-            "output": {"raw_dir": "data/raw"},
-        }
-
-    @pytest.fixture
-    def mock_university(self):
-        """Create mock university."""
-        return {
-            "name": "Test University",
-            "base_url": "https://test.edu",
-            "catalog_urls": ["https://test.edu/cursos"],
-            "seed_origin": "manual",
-        }
-
-    def test_init(self, mock_config):
-        """Test crawler initialization."""
-        crawler = WebCrawler(mock_config)
-        assert crawler.delay == 0.1
-        assert crawler.timeout == 10
-        assert crawler.max_retries == 2
-        assert crawler.global_max_depth == 2
-        assert crawler.global_max_pages == 10
-        assert crawler.download_pdfs is True
-        assert crawler.use_cache is True
-        assert crawler.max_pdf_bytes == 40 * 1024 * 1024
-        assert crawler.max_pdfs_per_domain == 5
-        assert crawler.fetch_external_docs is True
-        assert crawler.user_agent == "test-bot"
-        assert crawler.stats == {}
-        assert crawler._seen_hosts == set()
-        assert crawler.raw_dir == Path("data/raw")
-
-    def test_init_creates_dir(self, mock_config, tmp_path):
-        """Test that raw directory is created."""
-        mock_config["output"]["raw_dir"] = str(tmp_path / "raw")
-        crawler = WebCrawler(mock_config)
-        assert (tmp_path / "raw").exists()
-
-    def test_init_defaults(self):
-        """Test initialization with missing config values."""
-        config = {
-            "scraper": {
-                "request_delay_sec": 1.0,
-                "request_timeout_sec": 30,
-                "max_retries": 3,
-                "max_depth": 2,
-                "max_pages_per_university": 100,
-            },
-            "output": {"raw_dir": "data/raw"},
-        }
-        crawler = WebCrawler(config)
-        assert crawler.download_pdfs is True
-        assert crawler.use_cache is True
-        assert crawler.max_pdf_bytes == 40 * 1024 * 1024
-        assert crawler.max_pdfs_per_domain == 50
-        assert crawler.fetch_external_docs is True
-        assert crawler.user_agent == ACADEMIC_UA
-
-    def test_is_pdf_by_content_type(self, mock_config):
-        """Test PDF detection by Content-Type."""
-        crawler = WebCrawler(mock_config)
-        assert crawler._is_pdf("test.pdf", "application/pdf", b"") is True
-        assert crawler._is_pdf("test.pdf", "application/x-pdf", b"") is True
-
-    def test_is_pdf_by_url(self, mock_config):
-        """Test PDF detection by URL."""
-        crawler = WebCrawler(mock_config)
-        assert crawler._is_pdf("test.pdf", "text/html", b"") is True
-        assert crawler._is_pdf("test?format=pdf", "text/html", b"") is True
-
-    def test_is_pdf_by_magic_bytes(self, mock_config):
-        """Test PDF detection by magic bytes."""
-        crawler = WebCrawler(mock_config)
-        assert crawler._is_pdf("test", "text/html", b"%PDF-1.4") is True
-        assert crawler._is_pdf("test", "text/html", b"not pdf") is False
-
-    def test_is_spreadsheet_xlsx_content_type(self, mock_config):
-        """Test XLSX detection by Content-Type."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._is_spreadsheet(
-            "test.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            b""
-        )
-        assert result == "xlsx"
-
-    def test_is_spreadsheet_xlsx_extension(self, mock_config):
-        """Test XLSX detection by extension."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._is_spreadsheet("test.xlsx", "text/plain", b"")
-        assert result == "xlsx"
-
-    def test_is_spreadsheet_xls_content_type(self, mock_config):
-        """Test XLS detection by Content-Type."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._is_spreadsheet(
-            "test.xls",
-            "application/vnd.ms-excel",
-            b""
-        )
-        assert result == "xls"
-
-    def test_is_spreadsheet_xls_extension(self, mock_config):
-        """Test XLS detection by extension."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._is_spreadsheet("test.xls", "text/plain", b"")
-        assert result == "xls"
-
-    def test_is_spreadsheet_zip_magic(self, mock_config):
-        """Test XLSX detection by ZIP magic bytes."""
-        crawler = WebCrawler(mock_config)
-        # Simular un archivo ZIP con contenido xl/
-        with patch('zipfile.ZipFile') as mock_zip:
-            mock_zip.return_value.__enter__.return_value.namelist.return_value = ["xl/workbook.xml"]
-            result = crawler._is_spreadsheet("test", "text/plain", b"PK\x03\x04")
-            assert result == "xlsx"
-
-    def test_is_spreadsheet_ole_magic(self, mock_config):
-        """Test XLS detection by OLE magic bytes."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._is_spreadsheet("test", "text/plain", b"\xd0\xcf\x11\xe0")
-        assert result == "xls"
-
-    def test_is_spreadsheet_unknown(self, mock_config):
-        """Test unknown spreadsheet type."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._is_spreadsheet("test", "text/plain", b"unknown")
-        assert result == ""
-
-    def test_build_result_html(self, mock_config):
-        """Test building HTML result."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._build_result(
-            content=b"<html>test</html>",
-            content_type="text/html",
-            final_url="https://test.com",
-            is_pdf=False,
-            is_html=True,
-        )
-        assert result.text == "<html>test</html>"
-        assert result.is_html is True
-        assert result.content == b"<html>test</html>"
-
-    def test_build_result_html_unicode_error(self, mock_config):
-        """Test building HTML result with Unicode error."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._build_result(
-            content=b"\xff\xfe<html>",
-            content_type="text/html",
-            final_url="https://test.com",
-            is_pdf=False,
-            is_html=True,
-        )
-        assert result.text is not None
-
-    def test_build_result_pdf(self, mock_config):
-        """Test building PDF result."""
-        crawler = WebCrawler(mock_config)
-        result = crawler._build_result(
-            content=b"%PDF-1.4",
-            content_type="application/pdf",
-            final_url="https://test.com",
-            is_pdf=True,
-            is_html=False,
-        )
-        assert result.is_pdf is True
-        assert result.text == ""
-
-    def test_cache_paths(self, mock_config, mock_university):
-        """Test cache path generation."""
-        crawler = WebCrawler(mock_config)
-        meta_path, body_path = crawler._cache_paths("https://test.edu/url", mock_university)
-        assert "Test_University" in str(meta_path)
-        assert meta_path.suffix == ".json"
-        assert body_path.suffix == ""
-
-    def test_load_cache_missing(self, mock_config, mock_university):
-        """Test loading missing cache."""
-        crawler = WebCrawler(mock_config)
-        with patch('pathlib.Path.exists', return_value=False):
-            result = crawler._load_cache("https://test.edu", mock_university)
-            assert result is None
-
-    def test_load_cache_disabled(self, mock_config, mock_university):
-        """Test loading cache when disabled."""
-        mock_config["scraper"]["use_cache"] = False
-        crawler = WebCrawler(mock_config)
-        result = crawler._load_cache("https://test.edu", mock_university)
-        assert result is None
-
-    def test_load_cache_valid(self, mock_config, mock_university, tmp_path):
-        """Test loading valid cache."""
-        mock_config["output"]["raw_dir"] = str(tmp_path)
-        crawler = WebCrawler(mock_config)
-        
-        meta_content = {
-            "content_type": "text/html",
-            "final_url": "https://test.edu",
-            "is_pdf": False,
-            "is_html": True,
-            "doc_kind": "",
-            "body_path": str(tmp_path / "body.html"),
-        }
-        
-        with patch('pathlib.Path.exists', return_value=True):
-            with patch('pathlib.Path.read_text', return_value=json.dumps(meta_content)):
-                with patch('pathlib.Path.read_bytes', return_value=b"<html>test</html>"):
-                    result = crawler._load_cache("https://test.edu", mock_university)
-                    assert result is not None
-                    assert result.content == b"<html>test</html>"
-
-    def test_save_cache(self, mock_config, mock_university, tmp_path):
-        """Test saving cache."""
-        mock_config["output"]["raw_dir"] = str(tmp_path)
-        crawler = WebCrawler(mock_config)
-        
-        result = FetchResult(
-            content=b"<html>test</html>",
-            text="<html>test</html>",
-            content_type="text/html",
-            final_url="https://test.edu",
-            is_pdf=False,
-            is_html=True,
-        )
-        
-        with patch('pathlib.Path.write_bytes') as mock_write_bytes:
-            with patch('pathlib.Path.write_text') as mock_write_text:
-                crawler._save_cache("https://test.edu", mock_university, result)
-                mock_write_bytes.assert_called_once()
-                mock_write_text.assert_called_once()
-
-    def test_save_cache_disabled(self, mock_config, mock_university):
-        """Test saving cache when disabled."""
-        mock_config["scraper"]["use_cache"] = False
-        crawler = WebCrawler(mock_config)
-        
-        result = FetchResult(
-            content=b"test",
-            text="test",
-            content_type="text/html",
-            final_url="https://test.edu",
-            is_pdf=False,
-            is_html=True,
-        )
-        
-        with patch('pathlib.Path.write_bytes') as mock_write:
-            crawler._save_cache("https://test.edu", mock_university, result)
-            mock_write.assert_not_called()
-
-    def test_fetch_with_cache(self, mock_config, mock_university):
-        """Test fetch with cache hit."""
-        crawler = WebCrawler(mock_config)
-        
-        cached_result = FetchResult(
-            content=b"cached",
-            text="cached",
-            content_type="text/html",
-            final_url="https://test.edu",
-            is_pdf=False,
-            is_html=True,
-        )
-        
-        with patch.object(crawler, '_load_cache', return_value=cached_result):
-            result = crawler._fetch("https://test.edu", mock_university)
-            assert result == cached_result
-
-    def test_fetch_http_error(self, mock_config, mock_university):
-        """Test fetch with HTTP error."""
-        crawler = WebCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = requests.exceptions.HTTPError("404")
-            result = crawler._fetch("https://test.edu", mock_university)
-            assert result is None
-
-    def test_fetch_connection_error_retry_https(self, mock_config, mock_university):
-        """Test fetch with connection error and HTTPS retry."""
-        crawler = WebCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = [
-                requests.exceptions.ConnectionError("Connection refused"),
-                Mock(
-                    status_code=200,
-                    headers={"Content-Type": "text/html"},
-                    content=b"<html>test</html>",
-                    url="https://test.edu",
-                )
-            ]
-            
-            with patch.object(crawler, '_is_pdf', return_value=False):
-                with patch.object(crawler, '_is_spreadsheet', return_value=""):
-                    with patch.object(crawler, '_save_cache'):
-                        result = crawler._fetch("http://test.edu", mock_university)
-                        assert mock_get.call_count == 2
-
-    def test_fetch_timeout(self, mock_config, mock_university):
-        """Test fetch with timeout."""
-        crawler = WebCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = requests.exceptions.Timeout("Timeout")
-            result = crawler._fetch("https://test.edu", mock_university)
-            assert result is None
-
-    def test_fetch_general_exception(self, mock_config, mock_university):
-        """Test fetch with general exception."""
-        crawler = WebCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = Exception("Unknown error")
-            result = crawler._fetch("https://test.edu", mock_university)
-            assert result is None
-
-    def test_fetch_pdf(self, mock_config, mock_university):
-        """Test fetch PDF content."""
-        crawler = WebCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.return_value = Mock(
-                status_code=200,
-                headers={"Content-Type": "application/pdf"},
-                content=b"%PDF-1.4",
-                url="https://test.edu/doc.pdf",
-            )
-            
-            with patch.object(crawler, '_is_pdf', return_value=True):
-                with patch.object(crawler, '_save_cache'):
-                    result = crawler._fetch("https://test.edu/doc.pdf", mock_university)
-                    assert result is not None
-                    assert result.is_pdf is True
-
-    def test_fetch_truncated(self, mock_config, mock_university):
-        """Test fetch with truncated content."""
-        mock_config["scraper"]["max_pdf_mb"] = 1
-        crawler = WebCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.return_value = Mock(
-                status_code=200,
-                headers={"Content-Type": "application/pdf"},
-                iter_content=lambda *args: [b"x" * 1024 * 1024 * 2],  # 2MB
-                url="https://test.edu/doc.pdf",
-                close=Mock(),
-            )
-            
-            with patch.object(crawler, '_is_pdf', return_value=True):
-                with patch.object(crawler, '_save_cache'):
-                    result = crawler._fetch("https://test.edu/doc.pdf", mock_university)
-                    assert result is not None
-
-    def test_link_priority_curriculum(self, mock_config):
-        """Test link priority for curriculum."""
-        crawler = WebCrawler(mock_config)
-        priority = crawler._link_priority(
-            "https://test.edu/plan-de-estudios",
-            "/plan-de-estudios",
-            "Plan de estudios"
-        )
-        assert priority in (2, 3)
-
-    def test_link_priority_low(self, mock_config):
-        """Test link priority for low priority."""
-        crawler = WebCrawler(mock_config)
-        priority = crawler._link_priority(
-            "https://test.edu/noticias",
-            "/noticias",
-            "Noticias"
-        )
-        assert priority == 5
-
-    def test_link_priority_default(self, mock_config):
-        """Test link priority default."""
-        crawler = WebCrawler(mock_config)
-        priority = crawler._link_priority(
-            "https://test.edu/random",
-            "/random",
-            "Random text"
-        )
-        assert priority == 6
-
-    def test_link_priority_course(self, mock_config):
-        """Test link priority for course."""
-        crawler = WebCrawler(mock_config)
-        priority = crawler._link_priority(
-            "https://test.edu/curso-fisica",
-            "/curso-fisica",
-            "Curso de Física"
-        )
-        assert priority == 4
-
-    def test_extract_links_requires_bs4(self, mock_config):
-        """Test extract_links when BeautifulSoup not installed."""
-        crawler = WebCrawler(mock_config)
-        
-        with patch('crawler.BeautifulSoup', None):
-            with patch('builtins.__import__', side_effect=ImportError):
-                scored, pdf = crawler._extract_links("<html></html>", "https://test.edu", "test.edu")
-                assert scored == []
-                assert pdf == []
-
-    def test_extract_links_with_bs4(self, mock_config):
-        """Test extract_links with BeautifulSoup."""
-        crawler = WebCrawler(mock_config)
-        html = """
-        <html>
-            <body>
-                <a href="/doc.pdf">PDF</a>
-                <a href="/curso">Curso</a>
-                <a href="/download/malla">Descargar malla</a>
-                <iframe src="https://drive.google.com/file/d/123"></iframe>
-            </body>
-        </html>
+    def crawl_university(self, university: dict) -> Generator[dict, None, None]:
         """
+        Crawl a university's academic content.
         
-        # Mock BeautifulSoup para evitar import real
-        with patch('crawler.BeautifulSoup') as mock_bs:
-            # Crear mock de elementos
-            mock_a = Mock()
-            mock_a.name = "a"
-            mock_a.get.return_value = "/doc.pdf"
-            mock_a.get_text.return_value = "PDF"
+        Args:
+            university: University configuration dictionary
             
-            mock_a2 = Mock()
-            mock_a2.name = "a"
-            mock_a2.get.return_value = "/curso"
-            mock_a2.get_text.return_value = "Curso"
+        Yields:
+            Dictionary with fetched content and metadata
+        """
+        base = university.get("base_url") or (university.get("catalog_urls") or [""])[0]
+        allowed_domain = registered_domain(urlparse(base).netloc)
+        seeds = [normalize_url(u) for u in university.get("catalog_urls", []) if u]
+
+        # Apply limits
+        max_pages = university.get("max_pages") or self.global_max_pages
+        max_depth = university.get("max_depth") or self.global_max_depth
+        max_pdfs = university.get("max_pdfs") or self.max_pdfs_per_domain
+
+        # Initialize stats
+        uni_name = university.get("name", "?")
+        self.stats[uni_name] = CrawlStats()
+        stats = self.stats[uni_name]
+
+        # Queue setup
+        visited: set[str] = set()
+        seq = itertools.count()
+        queue: list[tuple[int, int, str, int, str]] = []
+        
+        for u in seeds:
+            priority = 1 if looks_like_pdf_url(u) else max(1, self._link_priority(u, urlparse(u).path.lower(), "") - 1)
+            queue.append((priority, next(seq), u, 0, ""))
+        heapq.heapify(queue)
+        
+        self._seen_hosts = {urlparse(u).netloc for u in seeds}
+        pdf_cap_warned = False
+
+        logger.info(
+            f"Crawl: {uni_name} | seeds={len(seeds)} "
+            f"max_pages={max_pages} max_depth={max_depth} max_pdfs={max_pdfs} "
+            f"pdfs={'on' if self.download_pdfs else 'off'} "
+            f"seed_origin={university.get('seed_origin', 'manual')}"
+        )
+
+        while queue and stats.pages_crawled < max_pages:
+            _prio, _, url, depth, found_on = heapq.heappop(queue)
+            url = normalize_url(url)
             
-            mock_iframe = Mock()
-            mock_iframe.name = "iframe"
-            mock_iframe.get.return_value = "https://drive.google.com/file/d/123"
-            mock_iframe.get_text.return_value = ""
-            
-            mock_soup = Mock()
-            mock_soup.find_all.return_value = [mock_a, mock_a2, mock_iframe]
-            mock_bs.return_value = mock_soup
-            
-            # Mock normalize_url y same_registered_domain
-            with patch('crawler.normalize_url') as mock_norm:
-                mock_norm.side_effect = lambda u, base=None: u if u.startswith("http") else f"https://test.edu{u}"
+            if not url or url in visited:
+                continue
+            visited.add(url)
+
+            if not self.robots.allowed(url):
+                logger.info(f"  robots.txt disallows, skipping: {url}")
+                continue
+
+            result = self._fetch(url, university)
+            if result is None:
+                continue
                 
-                with patch('crawler.same_registered_domain', return_value=True):
-                    with patch('crawler.looks_like_pdf_url') as mock_pdf:
-                        mock_pdf.return_value = False
-                        
-                        with patch.object(crawler, '_link_priority', return_value=4):
-                            with patch('crawler.external_doc_download_url', return_value=""):
-                                scored, pdf = crawler._extract_links(html, "https://test.edu", "test.edu")
-                                # Debería tener al menos el enlace /curso
-                                assert len(scored) >= 1
+            stats.pages_crawled += 1
 
-    def test_crawl_university_no_seeds(self, mock_config):
-        """Test crawling with no seeds."""
-        crawler = WebCrawler(mock_config)
-        university = {"name": "Test", "catalog_urls": []}
+            # Handle PDF documents
+            if result.is_pdf or result.doc_kind:
+                stats.pdfs_detected += 1
+                if stats.pdfs_detected > max_pdfs:
+                    if not pdf_cap_warned:
+                        logger.warning(f"  max_pdfs_per_domain ({max_pdfs}) reached")
+                        pdf_cap_warned = True
+                    continue
+                    
+                doc_type = "pdf" if result.is_pdf else result.doc_kind
+                logger.debug(f"  {doc_type.upper()}: {url} (found on: {found_on or 'seed'})")
+                yield {
+                    "type": doc_type,
+                    "content": result.content,
+                    "url": result.final_url,
+                    "found_on": found_on,
+                    "university": university
+                }
+                continue
+
+            # Skip non-HTML content
+            if not result.is_html:
+                logger.debug(f"  Skipping non-HTML/PDF ({result.content_type}): {url}")
+                continue
+
+            # Process HTML page
+            stats.html_pages += 1
+            logger.debug(f"  HTML ({len(result.text):,}b) depth={depth}: {url}")
+            yield {
+                "type": "html",
+                "content": result.text,
+                "url": result.final_url,
+                "found_on": found_on,
+                "university": university
+            }
+
+            # Extract links
+            scored_links, pdf_links = self._extract_links(result.text, url, allowed_domain)
+
+            # Queue PDFs
+            if self.download_pdfs and stats.pdfs_detected < max_pdfs:
+                for link in pdf_links:
+                    if link not in visited:
+                        heapq.heappush(queue, (1, next(seq), link, depth + 1, url))
+
+            # Queue HTML links
+            if depth < max_depth:
+                page_host = urlparse(url).netloc
+                for priority, link in scored_links:
+                    if link not in visited:
+                        link_depth = 0 if urlparse(link).netloc != page_host else depth + 1
+                        heapq.heappush(queue, (priority, next(seq), link, link_depth, url))
+
+        logger.info(
+            f"  Done: {uni_name} | "
+            f"{stats.pages_crawled} pages fetched "
+            f"({stats.html_pages} HTML, {stats.pdfs_detected} PDFs)"
+        )
+
+    # ── FETCH METHODS ──────────────────────────────────────────────────────
+
+    def _fetch(self, url: str, university: dict) -> Optional[FetchResult]:
+        """Fetch a URL with caching and retry logic."""
+        cached = self._load_cache(url, university)
+        if cached is not None:
+            return cached
+
+        self.limiter.wait()
         
-        results = list(crawler.crawl_university(university))
-        assert len(results) == 0
-
-    def test_crawl_university_with_seeds(self, mock_config):
-        """Test crawling with seeds."""
-        crawler = WebCrawler(mock_config)
-        university = {
-            "name": "Test",
-            "catalog_urls": ["https://test.edu/seed1", "https://test.edu/seed2"],
-            "base_url": "https://test.edu",
-        }
-        
-        # Mock robots allowed
-        with patch.object(crawler.robots, 'allowed', return_value=True):
-            # Mock fetch
-            with patch.object(crawler, '_fetch') as mock_fetch:
-                mock_fetch.return_value = FetchResult(
-                    content=b"<html>test</html>",
-                    text="<html>test</html>",
-                    content_type="text/html",
-                    final_url="https://test.edu/seed1",
-                    is_pdf=False,
-                    is_html=True,
-                )
-                
-                # Mock extract_links
-                with patch.object(crawler, '_extract_links', return_value=([], [])):
-                    results = list(crawler.crawl_university(university))
-                    assert len(results) == 1
-                    assert results[0]["type"] == "html"
-
-    def test_crawl_university_pdf(self, mock_config):
-        """Test crawling PDF."""
-        crawler = WebCrawler(mock_config)
-        university = {
-            "name": "Test",
-            "catalog_urls": ["https://test.edu/doc.pdf"],
-            "base_url": "https://test.edu",
-        }
-        
-        with patch.object(crawler.robots, 'allowed', return_value=True):
-            with patch.object(crawler, '_fetch') as mock_fetch:
-                mock_fetch.return_value = FetchResult(
-                    content=b"%PDF-1.4",
-                    text="",
-                    content_type="application/pdf",
-                    final_url="https://test.edu/doc.pdf",
-                    is_pdf=True,
-                    is_html=False,
-                )
-                
-                results = list(crawler.crawl_university(university))
-                assert len(results) == 1
-                assert results[0]["type"] == "pdf"
-
-    def test_crawl_university_pdf_cap(self, mock_config):
-        """Test PDF cap."""
-        mock_config["scraper"]["max_pdfs_per_domain"] = 1
-        crawler = WebCrawler(mock_config)
-        university = {
-            "name": "Test",
-            "catalog_urls": ["https://test.edu/doc1.pdf", "https://test.edu/doc2.pdf"],
-            "base_url": "https://test.edu",
-        }
-        
-        with patch.object(crawler.robots, 'allowed', return_value=True):
-            with patch.object(crawler, '_fetch') as mock_fetch:
-                mock_fetch.return_value = FetchResult(
-                    content=b"%PDF-1.4",
-                    text="",
-                    content_type="application/pdf",
-                    final_url="https://test.edu/doc1.pdf",
-                    is_pdf=True,
-                    is_html=False,
-                )
-                
-                results = list(crawler.crawl_university(university))
-                # Solo debería haber 1 PDF debido al cap
-                assert len(results) == 1
-
-    def test_crawl_university_robots_disallowed(self, mock_config):
-        """Test crawling with robots.txt disallow."""
-        crawler = WebCrawler(mock_config)
-        university = {
-            "name": "Test",
-            "catalog_urls": ["https://test.edu/seed"],
-            "base_url": "https://test.edu",
-        }
-        
-        with patch.object(crawler.robots, 'allowed', return_value=False):
-            results = list(crawler.crawl_university(university))
-            assert len(results) == 0
-
-    def test_crawl_university_fetch_fails(self, mock_config):
-        """Test crawling when fetch fails."""
-        crawler = WebCrawler(mock_config)
-        university = {
-            "name": "Test",
-            "catalog_urls": ["https://test.edu/seed"],
-            "base_url": "https://test.edu",
-        }
-        
-        with patch.object(crawler.robots, 'allowed', return_value=True):
-            with patch.object(crawler, '_fetch', return_value=None):
-                results = list(crawler.crawl_university(university))
-                assert len(results) == 0
-
-    def test_crawl_university_non_html(self, mock_config):
-        """Test crawling non-HTML content."""
-        crawler = WebCrawler(mock_config)
-        university = {
-            "name": "Test",
-            "catalog_urls": ["https://test.edu/image.png"],
-            "base_url": "https://test.edu",
-        }
-        
-        with patch.object(crawler.robots, 'allowed', return_value=True):
-            with patch.object(crawler, '_fetch') as mock_fetch:
-                mock_fetch.return_value = FetchResult(
-                    content=b"image",
-                    text="",
-                    content_type="image/png",
-                    final_url="https://test.edu/image.png",
-                    is_pdf=False,
-                    is_html=False,
-                )
-                
-                results = list(crawler.crawl_university(university))
-                assert len(results) == 0
-
-
-# ── TEST RSS CRAWLER ─────────────────────────────────────────────────────
-
-class TestRSSCrawler:
-    """Test RSSCrawler class."""
-
-    @pytest.fixture
-    def mock_config(self):
-        return {"scraper": {"request_timeout_sec": 30}}
-
-    def test_init(self, mock_config):
-        """Test initialization."""
-        crawler = RSSCrawler(mock_config)
-        assert crawler.timeout == 30
-        assert crawler.limiter is not None
-
-    def test_crawl_feed_no_feedparser(self, mock_config):
-        """Test crawling without feedparser."""
-        crawler = RSSCrawler(mock_config)
-        
-        with patch('crawler.feedparser', None):
-            with patch('builtins.__import__', side_effect=ImportError):
-                results = list(crawler.crawl_feed({"name": "test", "url": "https://test.com"}))
-                assert len(results) == 0
-
-    def test_crawl_feed_success(self, mock_config):
-        """Test successful feed crawl."""
-        crawler = RSSCrawler(mock_config)
-        
-        mock_feed = Mock()
-        mock_feed.entries = [
-            Mock(link="https://test.com/1", title="Entry 1"),
-            Mock(link="https://test.com/2", title="Entry 2"),
-        ]
-        
-        with patch('crawler.feedparser') as mock_feedparser:
-            mock_feedparser.parse.return_value = mock_feed
-            
-            with patch.object(crawler.session, 'get') as mock_get:
-                mock_get.return_value = Mock(text="<rss>test</rss>")
-                
-                results = list(crawler.crawl_feed({"name": "test", "url": "https://test.com"}))
-                assert len(results) == 2
-                assert results[0]["type"] == "rss"
-                assert results[0]["rss_source_name"] == "test"
-
-    def test_crawl_feed_error(self, mock_config):
-        """Test feed crawl with error."""
-        crawler = RSSCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = Exception("Network error")
-            
-            results = list(crawler.crawl_feed({"name": "test", "url": "https://test.com"}))
-            assert len(results) == 0
-
-
-# ── TEST TWITTER CRAWLER ─────────────────────────────────────────────────
-
-class TestTwitterCrawler:
-    """Test TwitterCrawler class."""
-
-    @pytest.fixture
-    def mock_config(self):
-        return {"scraper": {"request_timeout_sec": 30}}
-
-    def test_init_no_token(self, mock_config):
-        """Test initialization without token."""
-        crawler = TwitterCrawler(mock_config, None)
-        assert crawler.bearer_token is None
-
-    def test_init_with_token(self, mock_config):
-        """Test initialization with token."""
-        crawler = TwitterCrawler(mock_config, "test_token")
-        assert crawler.bearer_token == "test_token"
-
-    def test_crawl_queries_no_token(self, mock_config):
-        """Test crawling without token."""
-        crawler = TwitterCrawler(mock_config, None)
-        results = list(crawler.crawl_queries({"queries": ["q1"]}))
-        assert len(results) == 0
-
-    def test_crawl_queries_success(self, mock_config):
-        """Test successful query crawl."""
-        crawler = TwitterCrawler(mock_config, "test_token")
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.return_value = Mock(
-                status_code=200,
-                json=lambda: {"data": [{"id": "1", "text": "tweet"}]},
+        try:
+            resp = self.session.get(
+                url, 
+                timeout=(6, self.timeout),
+                allow_redirects=True, 
+                stream=True
             )
+            resp.raise_for_status()
             
-            results = list(crawler.crawl_queries({"queries": ["quantum"]}))
-            assert len(results) == 1
-            assert results[0]["type"] == "tweet"
-            assert results[0]["search_query"] == "quantum"
+            content_type = resp.headers.get("Content-Type", "").lower()
 
-    def test_crawl_queries_error(self, mock_config):
-        """Test query crawl with error."""
-        crawler = TwitterCrawler(mock_config, "test_token")
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = Exception("API error")
+            # Read content with size limit
+            content = b""
+            for chunk in resp.iter_content(65536):
+                content += chunk
+                if len(content) > self.max_pdf_bytes:
+                    logger.warning(f"  Truncated oversized download: {url}")
+                    break
+                    
+            final_url = normalize_url(resp.url) or url
+            resp.close()
             
-            results = list(crawler.crawl_queries({"queries": ["quantum"]}))
-            assert len(results) == 0
-
-
-# ── TEST REDDIT CRAWLER ──────────────────────────────────────────────────
-
-class TestRedditCrawler:
-    """Test RedditCrawler class."""
-
-    @pytest.fixture
-    def mock_config(self):
-        return {"scraper": {"request_timeout_sec": 30}}
-
-    def test_init(self, mock_config):
-        """Test initialization."""
-        crawler = RedditCrawler(mock_config)
-        assert crawler.timeout == 30
-
-    def test_crawl_source_success(self, mock_config):
-        """Test successful source crawl."""
-        crawler = RedditCrawler(mock_config)
-        
-        with patch.object(crawler, '_search') as mock_search:
-            mock_search.return_value = [{"type": "reddit_post", "content": {"title": "post"}}]
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response is not None else "?"
+            logger.warning(f"  HTTP {code}: {url}")
+            return None
             
-            results = list(crawler.crawl_source({
-                "subreddits": ["QuantumComputing"],
-                "queries": ["quantum"],
-            }))
-            assert len(results) == 1
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            # Retry with HTTPS if HTTP failed
+            if url.startswith("http://"):
+                https_url = "https://" + url[len("http://"):]
+                logger.info(f"  Retrying with HTTPS: {https_url}")
+                return self._fetch(https_url, university)
+            logger.warning(f"  {type(e).__name__}: {url}")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"  Error: {url} → {e}")
+            return None
 
-    def test_search_success(self, mock_config):
-        """Test successful search."""
-        crawler = RedditCrawler(mock_config)
+        # Determine content type
+        is_pdf = self._is_pdf(url, content_type, content)
+        doc_kind = "" if is_pdf else self._is_spreadsheet(url, content_type, content)
+        is_html = (not is_pdf and not doc_kind and 
+                  ("html" in content_type or content_type == "" or "xml" in content_type))
         
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.return_value = Mock(
-                status_code=200,
-                json=lambda: {
-                    "data": {
-                        "children": [
-                            {"data": {"title": "post1", "url": "https://reddit.com/1"}},
-                            {"data": {"title": "post2", "url": "https://reddit.com/2"}},
-                        ]
-                    }
-                },
+        result = self._build_result(content, content_type, final_url, is_pdf, is_html, doc_kind)
+        self._save_cache(url, university, result)
+        return result
+
+    @staticmethod
+    def _is_pdf(url: str, content_type: str, content: bytes) -> bool:
+        """Check if content is a PDF."""
+        if "pdf" in content_type:
+            return True
+        if looks_like_pdf_url(url):
+            return True
+        return content[:1024].lstrip()[:5] == b"%PDF-"
+
+    @staticmethod
+    def _is_spreadsheet(url: str, content_type: str, content: bytes) -> str:
+        """Check if content is a spreadsheet and return its type."""
+        path = urlparse(url.lower()).path
+        
+        if "spreadsheetml" in content_type or path.endswith(".xlsx"):
+            return "xlsx"
+        if "vnd.ms-excel" in content_type or path.endswith(".xls"):
+            return "xls"
+            
+        # Check ZIP-based spreadsheets
+        if content[:4] == b"PK\x03\x04":
+            import io as _io
+            import zipfile
+            try:
+                with zipfile.ZipFile(_io.BytesIO(content)) as z:
+                    if any(n.startswith("xl/") for n in z.namelist()[:80]):
+                        return "xlsx"
+            except Exception:
+                pass
+                
+        # Check OLE-based spreadsheets
+        if content[:4] == b"\xd0\xcf\x11\xe0":
+            return "xls"
+            
+        return ""
+
+    @staticmethod
+    def _build_result(content: bytes, content_type: str, final_url: str,
+                      is_pdf: bool, is_html: bool, doc_kind: str = "") -> FetchResult:
+        """Build a FetchResult from response data."""
+        text = ""
+        if is_html:
+            try:
+                text = content.decode("utf-8")
+            except UnicodeDecodeError:
+                text = content.decode("latin-1", errors="replace")
+                
+        return FetchResult(
+            content=content,
+            text=text,
+            content_type=content_type,
+            final_url=final_url,
+            is_pdf=is_pdf,
+            is_html=is_html,
+            doc_kind=doc_kind
+        )
+
+    # ── CACHE METHODS ──────────────────────────────────────────────────────
+
+    def _cache_paths(self, url: str, university: dict) -> tuple[Path, Path]:
+        """Get cache file paths for a URL."""
+        slug = slugify(university.get("name") or "misc")
+        out_dir = self.raw_dir / slug
+        out_dir.mkdir(parents=True, exist_ok=True)
+        h = url_hash(url)
+        return out_dir / f"{h}.meta.json", out_dir / h
+
+    def _load_cache(self, url: str, university: dict) -> Optional[FetchResult]:
+        """Load cached content if available."""
+        if not self.use_cache:
+            return None
+            
+        meta_path, _ = self._cache_paths(url, university)
+        if not meta_path.exists():
+            return None
+            
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            body_path = Path(meta["body_path"])
+            content = body_path.read_bytes()
+            
+            return self._build_result(
+                content,
+                meta.get("content_type", ""),
+                meta.get("final_url", url),
+                meta.get("is_pdf", False),
+                meta.get("is_html", False),
+                meta.get("doc_kind", "")
             )
-            
-            results = list(crawler._search("QuantumComputing", "quantum"))
-            assert len(results) == 2
-            assert results[0]["type"] == "reddit_post"
-            assert results[0]["subreddit"] == "QuantumComputing"
+        except Exception:
+            return None
 
-    def test_search_error(self, mock_config):
-        """Test search with error."""
-        crawler = RedditCrawler(mock_config)
-        
-        with patch.object(crawler.session, 'get') as mock_get:
-            mock_get.side_effect = Exception("API error")
+    def _save_cache(self, url: str, university: dict, result: FetchResult) -> None:
+        """Save content to cache."""
+        if not self.use_cache:
+            return
             
-            results = list(crawler._search("QuantumComputing", "quantum"))
-            assert len(results) == 0
+        meta_path, body_base = self._cache_paths(url, university)
+        
+        ext = ("pdf" if result.is_pdf 
+               else result.doc_kind 
+               or ("html" if result.is_html else "bin"))
+        body_path = body_base.with_suffix("." + ext)
+        
+        try:
+            body_path.write_bytes(result.content)
+            meta_path.write_text(
+                json.dumps({
+                    "url": url,
+                    "final_url": result.final_url,
+                    "content_type": result.content_type,
+                    "is_pdf": result.is_pdf,
+                    "is_html": result.is_html,
+                    "doc_kind": result.doc_kind,
+                    "body_path": str(body_path),
+                }, ensure_ascii=False),
+                encoding="utf-8"
+            )
+        except Exception as e:
+            logger.debug(f"Cache write failed for {url}: {e}")
+
+    # ── LINK EXTRACTION ────────────────────────────────────────────────────
+
+    def _extract_links(self, html: str, base_url: str, allowed_domain: str) -> Tuple[List[Tuple[int, str]], List[str]]:
+        """
+        Extract and score links from HTML.
+        
+        Returns:
+            Tuple of (scored_links, pdf_links)
+        """
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            logger.error("BeautifulSoup not installed: pip install beautifulsoup4")
+            return [], []
+
+        soup = BeautifulSoup(html, "html.parser")
+        scored_links: List[Tuple[int, str]] = []
+        pdf_links: List[str] = []
+        seen: set[str] = set()
+
+        for el in soup.find_all(["a", "iframe", "embed", "object"]):
+            raw = (el.get("href") or el.get("src") or el.get("data") or "").strip()
+            
+            # Skip invalid URLs
+            if not raw or raw.startswith(("#", "mailto:", "tel:", "javascript:", "about:", "data:")):
+                continue
+
+            # Handle external documents (Google Drive, SharePoint, etc.)
+            if self.fetch_external_docs and "://" in raw:
+                ext_url = external_doc_download_url(raw)
+                if ext_url and ext_url not in seen:
+                    seen.add(ext_url)
+                    pdf_links.append(ext_url)
+                continue
+
+            # Normalize and filter URL
+            full_url = normalize_url(raw, base=base_url)
+            if not full_url or full_url in seen:
+                continue
+            if not same_registered_domain(full_url, allowed_domain):
+                continue
+            seen.add(full_url)
+
+            anchor_text = el.get_text(" ", strip=True) if el.name == "a" else ""
+            path_low = urlparse(full_url).path.lower()
+
+            # Check for downloadable documents
+            is_download = any(w in path_low for w in ("download", "descargar", "documento", "archivo", "adjunto"))
+            is_doc = (looks_like_pdf_url(full_url) 
+                     or path_low.endswith((".xlsx", ".xls"))
+                     or (is_download and self.COURSE_ANCHOR_PATTERNS.search(anchor_text)))
+                     
+            if is_doc:
+                pdf_links.append(full_url)
+                continue
+
+            # Skip non-anchor elements for HTML crawling
+            if el.name != "a":
+                continue
+
+            # Skip junk URLs
+            if self.HARD_SKIP_PATTERNS.search(path_low):
+                continue
+
+            # Calculate priority
+            priority = self._link_priority(full_url, path_low, anchor_text)
+
+            # Adjust priority for new domains
+            host = urlparse(full_url).netloc
+            if host not in self._seen_hosts:
+                self._seen_hosts.add(host)
+                host_and_anchor = re.sub(r"[-.]", " ", host) + " " + anchor_text
+                first_label = host.split(".")[0]
+                
+                if (match_terms(host_and_anchor, ACADEMIC_SEED_TERMS) 
+                    or match_terms(host_and_anchor, STEM_TERMS)
+                    or re.fullmatch(r"[a-z]{2,4}", first_label)):
+                    priority = min(priority, 2)
+                else:
+                    priority = min(priority, 3)
+
+            scored_links.append((priority, full_url))
+
+        return scored_links, pdf_links
+
+    def _link_priority(self, url: str, path_low: str, anchor_text: str) -> int:
+        """
+        Calculate priority for a link (lower = higher priority).
+        
+        Priority levels:
+            1-2: Very high (curriculum, syllabus)
+            3-4: High (course-related)
+            5: Low (news, events)
+            6: Default
+        """
+        path_text = re.sub(r"[-_/.+%]+", " ", path_low)
+        combined = path_text + " " + anchor_text
+        
+        # Highest priority: curriculum materials
+        if (self.CURRICULUM_PRIORITY_PATTERNS.search(url) 
+            or self.CURRICULUM_PRIORITY_PATTERNS.search(anchor_text)):
+            return 2 if match_terms(combined, STEM_TERMS) else 3
+        
+        # Low priority: news, events, etc.
+        if (self.LOW_PRIORITY_URL_PATTERNS.search(path_low)
+            or match_terms(anchor_text, LOW_PRIORITY_TERMS)):
+            return 5
+        
+        # Medium priority: course-related
+        if (self.COURSE_URL_PATTERNS.search(url)
+            or self.COURSE_ANCHOR_PATTERNS.search(anchor_text)
+            or match_terms(combined, STEM_TERMS)):
+            return 3 if match_terms(combined, STEM_TERMS) else 4
+        
+        return 6
+
+
+# ── RSS CRAWLER ────────────────────────────────────────────────────────────
+
+class RSSCrawler:
+    """Simple RSS feed crawler."""
+    
+    def __init__(self, cfg: dict):
+        self.timeout = cfg["scraper"]["request_timeout_sec"]
+        self.limiter = RateLimiter(min_delay=1.5)
+        self.session = _make_session("", self.timeout, 2)
+
+    def crawl_feed(self, source: dict) -> Generator[dict, None, None]:
+        """Crawl an RSS feed."""
+        try:
+            import feedparser
+        except ImportError:
+            logger.error("feedparser not installed: pip install feedparser")
+            return
+
+        self.limiter.wait()
+        logger.info(f"RSS: {source['name']}")
+        
+        try:
+            resp = self.session.get(source["url"], timeout=self.timeout)
+            feed = feedparser.parse(resp.text)
+        except Exception as e:
+            logger.warning(f"RSS error {source['name']}: {e}")
+            return
+
+        for entry in feed.entries:
+            yield {
+                "type": "rss",
+                "content": entry,
+                "url": getattr(entry, "link", ""),
+                "university": None,
+                "rss_source_name": source["name"]
+            }
+            
+        logger.info(f"  RSS {source['name']}: {len(feed.entries)} entries")
+
+
+# ── TWITTER CRAWLER ────────────────────────────────────────────────────────
+
+class TwitterCrawler:
+    """Twitter API crawler for quantum education mentions."""
+    
+    def __init__(self, cfg: dict, bearer_token: Optional[str] = None):
+        self.bearer_token = bearer_token
+        self.timeout = cfg["scraper"]["request_timeout_sec"]
+        self.limiter = RateLimiter(min_delay=3.0)
+        self.session = _make_session("", self.timeout, 2)
+
+    def crawl_queries(self, source: dict) -> Generator[dict, None, None]:
+        """Crawl Twitter for given queries."""
+        if not self.bearer_token:
+            logger.warning("Twitter crawler: No bearer token provided")
+            return
+            
+        for query in source.get("queries", []):
+            yield from self._api_search(query)
+
+    def _api_search(self, query: str) -> Generator[dict, None, None]:
+        """Execute Twitter API search."""
+        self.limiter.wait()
+        
+        url = "https://api.twitter.com/2/tweets/search/recent"
+        headers = {"Authorization": f"Bearer {self.bearer_token}"}
+        params = {
+            "query": f"{query} -is:retweet lang:es OR lang:pt OR lang:en",
+            "max_results": 100,
+            "tweet.fields": "created_at,author_id",
+        }
+        
+        try:
+            resp = self.session.get(url, headers=headers, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            
+            for tweet in resp.json().get("data", []):
+                yield {
+                    "type": "tweet",
+                    "content": tweet,
+                    "url": f"https://twitter.com/i/web/status/{tweet['id']}",
+                    "university": None,
+                    "search_query": query
+                }
+        except Exception as e:
+            logger.warning(f"Twitter API '{query}': {e}")
+
+
+# ── REDDIT CRAWLER ─────────────────────────────────────────────────────────
+
+class RedditCrawler:
+    """Reddit crawler for quantum education mentions."""
+    
+    def __init__(self, cfg: dict, praw_cfg: Optional[dict] = None):
+        self.timeout = cfg["scraper"]["request_timeout_sec"]
+        self.limiter = RateLimiter(min_delay=2.0)
+        self.session = _make_session("", self.timeout, 2)
+
+    def crawl_source(self, source: dict) -> Generator[dict, None, None]:
+        """Crawl Reddit for given subreddits and queries."""
+        for subreddit in source.get("subreddits", []):
+            for query in source.get("queries", []):
+                yield from self._search(subreddit, query)
+
+    def _search(self, subreddit: str, query: str) -> Generator[dict, None, None]:
+        """Execute Reddit search."""
+        self.limiter.wait()
+        
+        url = f"https://www.reddit.com/r/{subreddit}/search.json"
+        params = {
+            "q": query,
+            "sort": "relevance",
+            "limit": 25,
+            "restrict_sr": 1
+        }
+        
+        try:
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            
+            for post in resp.json().get("data", {}).get("children", []):
+                data = post.get("data", {})
+                yield {
+                    "type": "reddit_post",
+                    "content": data,
+                    "url": data.get("url", ""),
+                    "university": None,
+                    "subreddit": subreddit
+                }
+        except Exception as e:
+            logger.warning(f"Reddit r/{subreddit} '{query}': {e}")
