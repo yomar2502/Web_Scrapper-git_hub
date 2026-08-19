@@ -31,18 +31,44 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import logging
 import math
+import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
-from pipeline import Pipeline, SummaryStats
-from utils import get_logger
-
-logger = get_logger("main")
+# Keep imports for the scraping stack lazy.  Besides making the module easier to
+# test, this lets ``python main.py --help`` work before optional/runtime
+# dependencies have been installed.
+logger = logging.getLogger("main")
 
 _TRUE_VALUES = {"1", "true", "yes", "y", "on"}
 _FALSE_VALUES = {"0", "false", "no", "n", "off"}
 _INPUT_SUFFIXES = {".csv", ".yaml", ".yml"}
+_YAML_SUFFIXES = {".yaml", ".yml"}
+
+
+def _load_runtime() -> type[Any]:
+    """Import the runtime only after CLI parsing and configure project logging."""
+    global logger
+
+    from utils import get_logger
+    from pipeline import Pipeline
+
+    logger = get_logger("main")
+    return Pipeline
+
+
+def _report_missing_dependency(exc: ModuleNotFoundError) -> None:
+    """Print a useful startup error even when project logging cannot import."""
+    missing = exc.name or str(exc)
+    print(
+        f"Missing required Python dependency: {missing}.\n"
+        "Install the project dependencies with:\n"
+        "  python -m pip install -r requirements.txt",
+        file=sys.stderr,
+    )
 
 
 def _str2bool(value: str | bool) -> bool:
@@ -119,8 +145,8 @@ def _validate_args(
     else:
         _validate_file(parser, args.sources, "--sources", _INPUT_SUFFIXES)
 
-    if (args.include_news or args.include_social) and not Path(args.sources).is_file():
-        parser.error("--include-news/--include-social require a valid --sources file")
+    if args.include_news or args.include_social:
+        _validate_file(parser, args.sources, "--sources", _YAML_SUFFIXES)
 
     output = Path(args.output)
     if output.suffix.lower() != ".csv":
@@ -129,6 +155,30 @@ def _validate_args(
         parser.error(f"--output points to a directory: {args.output}")
     if output.parent.exists() and not output.parent.is_dir():
         parser.error(f"--output parent is not a directory: {output.parent}")
+
+    # The pipeline writes more than the primary CSV.  Prevent an input file
+    # from being silently overwritten by any generated artifact.
+    generated_paths = {
+        "--output": output,
+        "JSON output": output.with_suffix(".json"),
+        "analytical output": output.with_suffix(".analytical.json"),
+        "university summary": output.parent / "university_summary.csv",
+        "country summary": output.parent / "country_summary.csv",
+    }
+    active_inputs = {"--config": Path(args.config)}
+    if args.input:
+        active_inputs["--input"] = Path(args.input)
+        if args.include_news or args.include_social:
+            active_inputs["--sources"] = Path(args.sources)
+    else:
+        active_inputs["--sources"] = Path(args.sources)
+
+    for input_label, input_path in active_inputs.items():
+        for output_label, generated_path in generated_paths.items():
+            if input_path.resolve(strict=False) == generated_path.resolve(strict=False):
+                parser.error(
+                    f"{output_label} would overwrite {input_label}: {input_path}"
+                )
 
     if args.country is not None:
         args.country = args.country.strip()
@@ -294,7 +344,6 @@ def _empty_result_exit_code(empty: bool, fail_on_empty: bool) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     args = parse_args(argv)
-    _log_run(args)
 
     overrides = {
         "max_depth": args.max_depth,
@@ -307,7 +356,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
 
     try:
-        pipeline = Pipeline(
+        pipeline_class = _load_runtime()
+        _log_run(args)
+
+        pipeline = pipeline_class(
             config_path=args.config,
             input_path=args.input,
             sources_path=args.sources,
@@ -324,7 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 logger.warning("Seed discovery completed without new seeds.")
             return _empty_result_exit_code(seeds == 0, args.fail_on_empty)
 
-        summary: SummaryStats = pipeline.run(
+        summary = pipeline.run(
             output_path=args.output,
             dry_run=args.dry_run,
             limit=args.limit,
@@ -345,6 +397,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.fail_on_empty,
         )
 
+    except ModuleNotFoundError as exc:
+        _report_missing_dependency(exc)
+        return 2
     except (FileNotFoundError, ValueError) as exc:
         logger.error("Invalid input or configuration: %s", exc)
         return 2

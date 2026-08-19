@@ -1,355 +1,518 @@
+"""Build country-level research metadata for the QISE candidate dataset.
+
+Sources:
+  * a locally installed QS rankings CSV;
+  * the World Bank API, with value years and an on-disk cache;
+  * explicitly versioned manual metadata.
+
+Example:
+    python geo_enricher.py --input data/qise_candidates.csv
+    python geo_enricher.py --countries AR,BR,CL,PE --offline
 """
-geo_enricher.py — Geopolitical and research-capacity metadata per country.
- 
-Fuentes de datos:
-  1. Tu CSV de QS Rankings (columna A = ranking, col B = Institution Name, col C = Country)
-     → Cargado automáticamente desde data/qs_rankings.csv
-     → El sistema toma el MEJOR ranking (número más bajo) por país
- 
-  2. World Bank API (gratis, sin auth)
-     → GDP per capita, R&D expenditure, internet penetration, researchers/million
- 
-  3. Datos manuales (IBM Q Network, Scimago, Quantum Initiatives)
-     → Difíciles de obtener por API, actualizables anualmente
-"""
- 
+
+from __future__ import annotations
+
+import argparse
 import csv
 import json
+import logging
+import re
+import sys
 import time
+from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
- 
-import requests
- 
-from utils import get_logger
- 
-logger = get_logger("geo_enricher")
- 
+from typing import Any
+
+from setup_qs_csv import validate_qs_csv
+
+logger = logging.getLogger("geo_enricher")
+
 WORLD_BANK_API = "https://api.worldbank.org/v2"
- 
-# Mapeo de nombres de país del CSV QS → código ISO
-COUNTRY_TO_CODE = {
-    "Argentina": "AR",
-    "Brazil": "BR",
-    "Chile": "CL",
-    "Colombia": "CO",
-    "Mexico": "MX",
-    "Peru": "PE",
-    "Venezuela": "VE",
-    "Venezuela (Bolivarian Republic of)": "VE",
-    "Uruguay": "UY",
-    "Costa Rica": "CR",
-    "Ecuador": "EC",
-    "Bolivia": "BO",
-    "Paraguay": "PY",
-    "Cuba": "CU",
-    "Panama": "PA",
-    "Guatemala": "GT",
-    "Honduras": "HN",
-    "El Salvador": "SV",
-    "Nicaragua": "NI",
-    "Dominican Republic": "DO",
-    "Puerto Rico": "PR",
-}
- 
-# ── DATOS MANUALES (cosas difíciles de obtener por API) ───────────────────────
-# Actualizar anualmente. Fuentes: IBM Q Network, Scimago 2024, UNESCO
+DEFAULT_INPUT = Path("data/qise_candidates.csv")
+DEFAULT_OUTPUT = Path("data/processed/geo_metadata.csv")
+DEFAULT_QS_PATH = Path("data/qs_rankings.csv")
+DEFAULT_CACHE_PATH = Path("data/processed/wb_cache.json")
+DEFAULT_USER_AGENT = "QISE-LatAm-Research-Bot/2.0 (academic research)"
+CACHE_VERSION = 2
+MANUAL_DATA_REFERENCE_YEAR = 2024
+
+# These values are not fetched automatically. They must be reviewed before a
+# publication and are labelled with their reference year in every output row.
 MANUAL_DATA = {
-    "AR": {
-        "times_ranking_top_university": 601,
-        "scimago_country_rank_physics": 32,
-        "ibm_quantum_network_member": True,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": True,
-    },
-    "BR": {
-        "times_ranking_top_university": 501,
-        "scimago_country_rank_physics": 13,
-        "ibm_quantum_network_member": True,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": True,
-    },
-    "CL": {
-        "times_ranking_top_university": 601,
-        "scimago_country_rank_physics": 39,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": True,
-    },
-    "CO": {
-        "times_ranking_top_university": 801,
-        "scimago_country_rank_physics": 47,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": True,
-    },
-    "MX": {
-        "times_ranking_top_university": 601,
-        "scimago_country_rank_physics": 26,
-        "ibm_quantum_network_member": True,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": True,
-    },
-    "PE": {
-        "times_ranking_top_university": 1001,
-        "scimago_country_rank_physics": 62,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": False,
-    },
-    "VE": {
-        "times_ranking_top_university": 1001,
-        "scimago_country_rank_physics": 71,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": False,
-    },
-    "UY": {
-        "times_ranking_top_university": 1001,
-        "scimago_country_rank_physics": 58,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": False,
-    },
-    "CR": {
-        "times_ranking_top_university": 1001,
-        "scimago_country_rank_physics": 78,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": False,
-    },
-    "EC": {
-        "times_ranking_top_university": 1001,
-        "scimago_country_rank_physics": 85,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": False,
-    },
-    "CU": {
-        "times_ranking_top_university": 1001,
-        "scimago_country_rank_physics": 90,
-        "ibm_quantum_network_member": False,
-        "national_quantum_initiative": False,
-        "latam_quantum_alliance_member": False,
-    },
+    "AR": {"times_top_rank": 601, "scimago_country_rank_physics": 32,
+           "ibm_quantum_network_member": True, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": True},
+    "BR": {"times_top_rank": 501, "scimago_country_rank_physics": 13,
+           "ibm_quantum_network_member": True, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": True},
+    "CL": {"times_top_rank": 601, "scimago_country_rank_physics": 39,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": True},
+    "CO": {"times_top_rank": 801, "scimago_country_rank_physics": 47,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": True},
+    "MX": {"times_top_rank": 601, "scimago_country_rank_physics": 26,
+           "ibm_quantum_network_member": True, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": True},
+    "PE": {"times_top_rank": 1001, "scimago_country_rank_physics": 62,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": False},
+    "VE": {"times_top_rank": 1001, "scimago_country_rank_physics": 71,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": False},
+    "UY": {"times_top_rank": 1001, "scimago_country_rank_physics": 58,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": False},
+    "CR": {"times_top_rank": 1001, "scimago_country_rank_physics": 78,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": False},
+    "EC": {"times_top_rank": 1001, "scimago_country_rank_physics": 85,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": False},
+    "CU": {"times_top_rank": 1001, "scimago_country_rank_physics": 90,
+           "ibm_quantum_network_member": False, "national_quantum_initiative": False,
+           "latam_quantum_alliance_member": False},
 }
- 
+
 WB_INDICATORS = {
     "gdp_per_capita_usd": "NY.GDP.PCAP.CD",
     "rd_expenditure_pct_gdp": "GB.XPD.RSDV.GD.ZS",
     "internet_penetration_pct": "IT.NET.USER.ZS",
     "researchers_per_million": "SP.POP.SCIE.RD.P6",
 }
- 
- 
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_now() -> str:
+    return _utc_now().isoformat().replace("+00:00", "Z")
+
+
+def _normalize_country_codes(values: Sequence[str]) -> tuple[list[str], list[str]]:
+    valid: set[str] = set()
+    invalid: set[str] = set()
+    for value in values:
+        code = (value or "").strip().upper()
+        if re.fullmatch(r"[A-Z]{2}", code):
+            valid.add(code)
+        elif code:
+            invalid.add(code)
+    return sorted(valid), sorted(invalid)
+
+
+def load_config(path: Path) -> dict:
+    """Load the project YAML config and reject malformed root structures."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Config does not exist or is not a file: {path}")
+    try:
+        import yaml
+
+        with path.open(encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except ModuleNotFoundError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Could not parse config {path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError("Config root must be a YAML mapping")
+    return config
+
+
+def country_codes_from_dataset(path: Path) -> list[str]:
+    """Read distinct ISO-2 country codes from a candidate CSV or JSON file."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Candidate dataset does not exist: {path}")
+
+    if path.suffix.lower() == ".csv":
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if "country_code" not in (reader.fieldnames or []):
+                raise ValueError("Candidate CSV has no 'country_code' column")
+            raw_codes = [row.get("country_code", "") for row in reader]
+    elif path.suffix.lower() == ".json":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("Candidate JSON must contain a list of rows")
+        raw_codes = [
+            row.get("country_code", "")
+            for row in data
+            if isinstance(row, dict)
+        ]
+    else:
+        raise ValueError("Candidate dataset must be .csv or .json")
+
+    valid, invalid = _normalize_country_codes(raw_codes)
+    if invalid:
+        logger.warning("Ignored invalid country codes in dataset: %s", invalid)
+    if not valid:
+        raise ValueError("Candidate dataset contains no valid ISO-2 country codes")
+    return valid
+
+
+class _OfflineSession:
+    """Minimal session used when the CLI is explicitly cache-only."""
+
+    def __init__(self):
+        self.headers: dict[str, str] = {}
+
+    def get(self, *_args, **_kwargs):
+        raise RuntimeError("Network access is disabled in offline mode")
+
+    def close(self) -> None:
+        pass
+
+
 class GeoEnricher:
- 
-    def __init__(self, cfg: dict, cache_path: str = "data/processed/wb_cache.json"):
-        self.cfg = cfg
+    """Combine World Bank, QS and versioned manual data by country."""
+
+    def __init__(
+        self,
+        cfg: dict | None = None,
+        cache_path: str | Path = DEFAULT_CACHE_PATH,
+        qs_path: str | Path = DEFAULT_QS_PATH,
+        *,
+        session: Any | None = None,
+        cache_ttl_days: int = 30,
+        offline: bool = False,
+    ):
+        if cache_ttl_days < 0:
+            raise ValueError("cache_ttl_days must be >= 0")
+        self.cfg = cfg or {}
+        if not isinstance(self.cfg, dict):
+            raise ValueError("cfg must be a mapping")
+        scraper = self.cfg.get("scraper") or {}
+        geo_cfg = self.cfg.get("geo_enrichment") or {}
+        if not isinstance(scraper, dict) or not isinstance(geo_cfg, dict):
+            raise ValueError("scraper and geo_enrichment config sections must be mappings")
+
         self.cache_path = Path(cache_path)
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        self.qs_path = Path(qs_path)
+        self.cache_ttl = timedelta(days=cache_ttl_days)
+        self.offline = offline
+        self.timeout = float(geo_cfg.get("request_timeout_sec", 15))
+        self.request_delay = max(0.0, float(geo_cfg.get("request_delay_sec", 0.25)))
+        self.max_retries = max(0, int(geo_cfg.get("max_retries", 2)))
         self._cache = self._load_cache()
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = cfg["scraper"]["user_agent"]
- 
-        # Cargar QS rankings desde tu CSV
+
+        self.session = session or (_OfflineSession() if offline else self._create_session())
+        if not hasattr(self.session, "headers"):
+            self.session.headers = {}
+        self.session.headers["User-Agent"] = scraper.get(
+            "user_agent", DEFAULT_USER_AGENT
+        )
         self.qs_by_country = self._load_qs_csv()
- 
-    # ── API PÚBLICA ───────────────────────────────────────────────────────────
- 
-    def enrich_dataset(self, country_codes: list[str]) -> dict[str, dict]:
-        result = {}
-        for code in set(country_codes):
-            result[code] = self._get_country_data(code)
-        return result
- 
-    def save_geo_metadata(self, country_codes: list[str], output_path: str) -> None:
+
+    @staticmethod
+    def _create_session():
+        import requests
+
+        return requests.Session()
+
+    def close(self) -> None:
+        close = getattr(self.session, "close", None)
+        if callable(close):
+            close()
+
+    def __enter__(self) -> "GeoEnricher":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+    def enrich_dataset(self, country_codes: Sequence[str]) -> dict[str, dict]:
+        valid, invalid = _normalize_country_codes(country_codes)
+        if invalid:
+            logger.warning("Ignored invalid country codes: %s", invalid)
+        return {code: self._get_country_data(code) for code in valid}
+
+    def save_geo_metadata(
+        self,
+        country_codes: Sequence[str],
+        output_path: str | Path,
+    ) -> int:
         data = self.enrich_dataset(country_codes)
         if not data:
-            return
- 
-        all_fields = set()
-        for row in data.values():
-            all_fields.update(row.keys())
+            raise ValueError("No valid countries were provided")
+
+        output = Path(output_path)
+        if output.suffix.lower() != ".csv":
+            raise ValueError("Geo metadata output must be a .csv file")
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        all_fields = set().union(*(row.keys() for row in data.values()))
         fieldnames = ["country_code"] + sorted(all_fields - {"country_code"})
- 
-        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for code, row in sorted(data.items()):
-                writer.writerow({"country_code": code, **row})
- 
-        logger.info(f"Geo metadata guardado: {output_path} ({len(data)} países)")
- 
-    # ── CARGA DE TU CSV QS ────────────────────────────────────────────────────
- 
+        temporary = output.with_name(f".{output.name}.tmp")
+        try:
+            with temporary.open("w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for code, row in sorted(data.items()):
+                    writer.writerow({"country_code": code, **row})
+            temporary.replace(output)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+        logger.info("Geo metadata saved: %s (%s countries)", output, len(data))
+        return len(data)
+
     def _load_qs_csv(self) -> dict[str, dict]:
-        """
-        Lee tu CSV de QS Rankings.
-        Estructura esperada:
-          - La fila del encabezado tiene "Institution Name" en col B, "Country" en col C
-          - El número de ranking QS es el número de fila (col A cuando se exporta a CSV)
-          - O bien hay una columna numérica de ranking
- 
-        Devuelve dict: country_code → {qs_top_rank, qs_top_university, qs_universities_count}
-        """
-        qs_path = Path("data/qs_rankings.csv")
-        if not qs_path.exists():
-            logger.warning(
-                "No se encontró data/qs_rankings.csv — usando rankings manuales.\n"
-                "  Para usar tu CSV: copia el archivo a data/qs_rankings.csv"
-            )
+        if not self.qs_path.exists():
+            logger.warning("QS CSV not found at %s; QS fields will be empty", self.qs_path)
             return {}
- 
-        by_country: dict[str, list] = {}
- 
-        # Lee con múltiples encodings + errors=replace para tolerar bytes corruptos
-        import io as _io
-        raw = None
-        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
-            try:
-                candidate = open(qs_path, encoding=enc, errors="replace").read()
-                replacements = candidate.count("\ufffd")
-                logger.debug(f"Encoding {enc}: {replacements} bytes reemplazados")
-                if raw is None or replacements < raw[1]:
-                    raw = (candidate, replacements)
-            except Exception as e:
-                logger.debug(f"Encoding {enc} falló: {e}")
-        if raw is None:
-            logger.error("No se pudo leer el CSV QS")
+        try:
+            report = validate_qs_csv(self.qs_path)
+        except (OSError, ValueError) as exc:
+            logger.warning("Could not load QS CSV %s: %s", self.qs_path, exc)
             return {}
-        raw_text, bad_bytes = raw
-        logger.info(f"QS CSV leído ({bad_bytes} bytes corruptos ignorados)")
- 
-        reader = csv.DictReader(_io.StringIO(raw_text))
-        headers = reader.fieldnames or []
-        logger.info(f"QS CSV columnas detectadas: {headers}")
- 
-        rank_col    = self._find_col(headers, ["rank", "ranking", "#", "position"])
-        name_col    = self._find_col(headers, ["institution name", "institution", "university", "name"])
-        country_col = self._find_col(headers, ["country", "country/territory", "territory", "pais"])
- 
-        if not name_col or not country_col:
-            logger.error(
-                f"No pude detectar columnas en QS CSV. Columnas: {headers}\n"
-                "  Necesito una columna 'Institution Name' y una 'Country/Territory'"
-            )
-            return {}
- 
-        logger.info(f"QS CSV: rank='{rank_col}' name='{name_col}' country='{country_col}'")
- 
-        for i, row in enumerate(reader, start=2):
-            country_str = (row.get(country_col) or "").strip()
-            name_str    = (row.get(name_col) or "").strip()
-            if not country_str or not name_str:
-                continue
- 
-            if rank_col and row.get(rank_col):
-                rank_str = str(row[rank_col]).strip().replace("+", "").replace("=", "")
-                try:
-                    rank = int(rank_str.split("-")[0])
-                except ValueError:
-                    rank = i
-            else:
-                rank = i
- 
-            code = COUNTRY_TO_CODE.get(country_str)
-            if not code:
-                for k, v in COUNTRY_TO_CODE.items():
-                    if k.lower() in country_str.lower() or country_str.lower() in k.lower():
-                        code = v
-                        break
-            if not code:
-                continue
- 
-            if code not in by_country:
-                by_country[code] = []
-            by_country[code].append({"rank": rank, "name": name_str})
- 
-        # Resumir por país: mejor ranking + cantidad de universidades rankeadas
-        result = {}
-        for code, unis in by_country.items():
-            unis_sorted = sorted(unis, key=lambda x: x["rank"])
+
+        by_country: dict[str, list[dict[str, Any]]] = {}
+        for row in report.latin_american_rows:
+            by_country.setdefault(str(row["code"]), []).append({
+                "rank": int(row["rank"]),
+                "name": str(row["name"]),
+            })
+
+        result: dict[str, dict] = {}
+        for code, universities in by_country.items():
+            ordered = sorted(universities, key=lambda item: (item["rank"], item["name"]))
             result[code] = {
-                "qs_top_rank": unis_sorted[0]["rank"],
-                "qs_top_university": unis_sorted[0]["name"],
-                "qs_universities_in_ranking": len(unis),
+                "qs_top_rank": ordered[0]["rank"],
+                "qs_top_university": ordered[0]["name"],
+                "qs_universities_in_ranking": len(ordered),
             }
-            logger.info(
-                f"QS {code}: top={unis_sorted[0]['rank']} ({unis_sorted[0]['name']}), "
-                f"total={len(unis)} universidades"
-            )
- 
-        logger.info(f"QS CSV cargado: {len(result)} países, {sum(len(v) for v in by_country.values())} universidades")
+        logger.info(
+            "QS CSV loaded: %s countries, %s universities",
+            len(result),
+            sum(len(rows) for rows in by_country.values()),
+        )
         return result
- 
-    @staticmethod
-    def _find_col(headers: list[str], candidates: list[str]) -> str | None:
-        """Busca la primera columna cuyo nombre contenga alguno de los candidatos."""
-        for h in headers:
-            for c in candidates:
-                if c.lower() in h.lower():
-                    return h
-        return None
- 
-    # ── ENSAMBLE DE DATOS POR PAÍS ─────────────────────────────────────────────
- 
+
     def _get_country_data(self, country_code: str) -> dict:
-        wb_data  = self._fetch_worldbank(country_code)
-        manual   = MANUAL_DATA.get(country_code, {})
-        qs_data  = self.qs_by_country.get(country_code, {})
- 
-        # Prioridad: tu CSV QS > datos manuales
-        return {
-            "country_code": country_code,
-            **wb_data,
+        code = country_code.strip().upper()
+        manual = MANUAL_DATA.get(code, {})
+        result = {
+            "country_code": code,
+            **self._fetch_worldbank(code),
             **manual,
-            **qs_data,   # sobreescribe qs_world_ranking_top_university si existe en manual
+            **self.qs_by_country.get(code, {}),
         }
- 
-    # ── WORLD BANK ─────────────────────────────────────────────────────────────
- 
-    def _fetch_worldbank(self, country_code: str) -> dict:
-        result = {}
-        for var_name, indicator in WB_INDICATORS.items():
-            cache_key = f"{country_code}_{indicator}"
-            if cache_key in self._cache:
-                result[var_name] = self._cache[cache_key]
-                continue
-            value = self._wb_api_call(country_code, indicator)
-            self._cache[cache_key] = value
-            result[var_name] = value
-            time.sleep(0.5)
-        self._save_cache()
+        if manual:
+            result["manual_data_reference_year"] = MANUAL_DATA_REFERENCE_YEAR
         return result
- 
-    def _wb_api_call(self, country_code: str, indicator: str) -> float | None:
+
+    @staticmethod
+    def _cache_record(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict) and "value" in value:
+            return {
+                "value": value.get("value"),
+                "year": value.get("year"),
+                "fetched_at": value.get("fetched_at"),
+            }
+        return {"value": value, "year": None, "fetched_at": None}
+
+    def _is_cache_fresh(self, record: dict[str, Any]) -> bool:
+        if self.offline:
+            return True
+        fetched_at = record.get("fetched_at")
+        if not fetched_at or self.cache_ttl <= timedelta(0):
+            return False
+        try:
+            timestamp = datetime.fromisoformat(str(fetched_at).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return _utc_now() - timestamp <= self.cache_ttl
+
+    def _fetch_worldbank(self, country_code: str) -> dict:
+        result: dict[str, Any] = {}
+        cache_changed = False
+        indicators = list(WB_INDICATORS.items())
+
+        for index, (field, indicator) in enumerate(indicators):
+            cache_key = f"{country_code}_{indicator}"
+            cached_raw = self._cache.get(cache_key)
+            cached = self._cache_record(cached_raw) if cached_raw is not None else None
+
+            if cached is not None and self._is_cache_fresh(cached):
+                record = cached
+            elif self.offline:
+                record = {"value": None, "year": None, "fetched_at": None}
+            else:
+                value, year, request_succeeded = self._wb_api_call(
+                    country_code, indicator
+                )
+                if value is None and cached is not None and cached.get("value") is not None:
+                    logger.warning("Using stale cache for %s/%s", country_code, indicator)
+                    record = cached
+                elif not request_succeeded:
+                    record = {"value": None, "year": None, "fetched_at": None}
+                else:
+                    record = {"value": value, "year": year, "fetched_at": _iso_now()}
+                    self._cache[cache_key] = record
+                    cache_changed = True
+                if self.request_delay and index < len(indicators) - 1:
+                    time.sleep(self.request_delay)
+
+            result[field] = record.get("value")
+            result[f"{field}_year"] = record.get("year")
+
+        if cache_changed:
+            self._save_cache()
+        return result
+
+    def _wb_api_call(
+        self,
+        country_code: str,
+        indicator: str,
+    ) -> tuple[float | None, str | None, bool]:
         url = f"{WORLD_BANK_API}/country/{country_code}/indicator/{indicator}"
-        params = {"format": "json", "mrv": 5, "per_page": 5}
-        try:
-            resp = self.session.get(url, params=params, timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-            if len(data) < 2 or not data[1]:
-                return None
-            for entry in data[1]:
-                if entry.get("value") is not None:
-                    return round(float(entry["value"]), 4)
-        except Exception as e:
-            logger.warning(f"World Bank API {country_code}/{indicator}: {e}")
-        return None
- 
-    def _load_cache(self) -> dict:
-        if self.cache_path.exists():
+        params = {"format": "json", "mrv": 10, "per_page": 10}
+        for attempt in range(self.max_retries + 1):
             try:
-                return json.loads(self.cache_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
- 
-    def _save_cache(self) -> None:
+                response = self.session.get(url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                data = response.json()
+                entries = data[1] if isinstance(data, list) and len(data) > 1 else []
+                if not isinstance(entries, list):
+                    return None, None, True
+                for entry in entries:
+                    if not isinstance(entry, dict) or entry.get("value") is None:
+                        continue
+                    try:
+                        value = Decimal(str(entry["value"])).quantize(
+                            Decimal("0.0001"),
+                            rounding=ROUND_HALF_UP,
+                        )
+                    except (InvalidOperation, ValueError):
+                        continue
+                    return float(value), str(entry.get("date") or "") or None, True
+                return None, None, True
+            except Exception as exc:
+                if attempt >= self.max_retries:
+                    logger.warning("World Bank API %s/%s: %s", country_code, indicator, exc)
+                    break
+                time.sleep(min(2 ** attempt, 4))
+        return None, None, False
+
+    def _load_cache(self) -> dict[str, Any]:
+        if not self.cache_path.exists():
+            return {}
         try:
-            self.cache_path.write_text(
-                json.dumps(self._cache, indent=2, ensure_ascii=False), encoding="utf-8"
+            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Ignoring invalid World Bank cache %s: %s", self.cache_path, exc)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("Ignoring World Bank cache with invalid root type")
+            return {}
+        if data.get("version") == CACHE_VERSION and isinstance(data.get("entries"), dict):
+            return data["entries"]
+        # Version 1 stored cache entries directly as key -> scalar.
+        return data
+
+    def _save_cache(self) -> None:
+        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": CACHE_VERSION,
+            "updated_at": _iso_now(),
+            "entries": self._cache,
+        }
+        temporary = self.cache_path.with_name(f".{self.cache_path.name}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
             )
-        except Exception as e:
-            logger.warning(f"No pude guardar cache WB: {e}")
+            temporary.replace(self.cache_path)
+        except OSError as exc:
+            logger.warning("Could not save World Bank cache: %s", exc)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
+        "--countries",
+        help="Comma/space-separated ISO-2 codes; otherwise codes come from --input",
+    )
+    source.add_argument(
+        "--input",
+        type=Path,
+        default=DEFAULT_INPUT,
+        help=f"Candidate CSV/JSON (default: {DEFAULT_INPUT})",
+    )
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--config", type=Path, default=Path("config.yaml"))
+    parser.add_argument("--qs-csv", type=Path, default=DEFAULT_QS_PATH)
+    parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE_PATH)
+    parser.add_argument("--cache-ttl-days", type=int, default=30)
+    parser.add_argument("--refresh", action="store_true", help="Ignore cache freshness")
+    parser.add_argument("--offline", action="store_true", help="Use cache only; no API calls")
+    return parser
+
+
+def _configure_cli_logging() -> None:
+    if logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(levelname)s | %(name)s | %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _configure_cli_logging()
+
+    try:
+        if args.cache_ttl_days < 0:
+            raise ValueError("--cache-ttl-days must be >= 0")
+        config = load_config(args.config)
+        if args.countries:
+            raw_codes = re.split(r"[,;\s]+", args.countries)
+            country_codes, invalid = _normalize_country_codes(raw_codes)
+            if invalid:
+                raise ValueError(f"Invalid ISO-2 country codes: {invalid}")
+        else:
+            country_codes = country_codes_from_dataset(args.input)
+
+        with GeoEnricher(
+            config,
+            cache_path=args.cache,
+            qs_path=args.qs_csv,
+            cache_ttl_days=0 if args.refresh else args.cache_ttl_days,
+            offline=args.offline,
+        ) as enricher:
+            count = enricher.save_geo_metadata(country_codes, args.output)
+        print(f"Saved metadata for {count} countries to {args.output}")
+        return 0
+    except ModuleNotFoundError as exc:
+        print(
+            f"Missing dependency {exc.name or exc}. "
+            "Run: python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+    except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as exc:
+        logger.error("Geo enrichment failed: %s", exc)
+        return 2
+    except KeyboardInterrupt:
+        logger.info("Geo enrichment interrupted")
+        return 130
+    except Exception:
+        logger.exception("Unexpected geo enrichment failure")
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
